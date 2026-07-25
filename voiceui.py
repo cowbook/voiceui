@@ -44,6 +44,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QSize
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QLinearGradient, QFont,
     QRadialGradient, QPixmap, QFontDatabase, QIcon,
+    QShortcut, QKeySequence, QKeyEvent,
 )
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -80,7 +81,7 @@ FRAME_SAMPLES  = 512                 # silero-vad 要求 16kHz 下 512/1024/1536
 CHANNELS       = 1
 
 # VAD
-SILENCE_END_FRAMES  = 12             # ~384ms 静音结尾
+SILENCE_END_FRAMES  = 20             # ~640ms 静音结尾（中文说话默认是这样）
 MIN_SPEECH_FRAMES   = 4              # ~128ms 最短有效发言
 PRE_BUFFER_FRAMES   = 6              # 发言开始前预缓冲 ~200ms，防切音头
 DB_FLOOR, DB_CEIL   = -60.0, 0.0     # dB 显示范围
@@ -108,7 +109,7 @@ class AudioWorker(QThread):
         # 故意不传 parent：避免 VoiceUIMain 销毁时被 Qt 连带析构
         super().__init__()
         self._lock = threading.Lock()
-        self.threshold_db   = -40.0        # 噪声门限
+        self.threshold_db   = -30.0        # 默认门限；启用监听时会自动校准
         self.listening_on   = False        # 总开关
         self.barge_in       = False        # 是否处于"双工打断"模式（TTS 期间）
         # Whisper 模型懒加载
@@ -151,6 +152,35 @@ class AudioWorker(QThread):
                 self._silence_count = 0
                 self._speech_frames = 0
     
+    def calibrate(self, duration_s: float = 1.5):
+        """安静期采样 ~1.5s，自动设阈值 = max(环境噪声 dBFS) + 6dB"""
+        import sounddevice as sd
+        import math
+        sr = SAMPLE_RATE
+        block = FRAME_SAMPLES
+        levels = []
+        try:
+            stream = sd.InputStream(samplerate=sr, channels=1, dtype='float32', blocksize=block)
+            with stream:
+                needed = int(duration_s * sr / block)
+                for _ in range(needed):
+                    chunk, _ = stream.read(block)
+                    rms = float(np.sqrt(np.mean(chunk**2)) + 1e-10)
+                    db = 20 * math.log10(rms)
+                    levels.append(db)
+        except Exception as e:
+            print(f"[calibrate] 采样失败: {e}", file=sys.stderr)
+            return None, None
+        if not levels:
+            return None, None
+        levels.sort()
+        idx = int(len(levels) * 0.95)
+        p95 = levels[min(idx, len(levels)-1)]
+        new_threshold = max(min(p95 + 6.0, -10.0), -55.0)
+        with self._lock:
+            self.threshold_db = new_threshold
+        return new_threshold, p95
+
     def set_barge_in(self, on: bool):
         with self._lock:
             self.barge_in = bool(on)
@@ -245,8 +275,10 @@ class AudioWorker(QThread):
         except Exception as e:
             speech_prob = 0.0
         
-        # 综合判断：超过鼠标阀值 且 VAD 高概率认为是语音
-        is_active = above_threshold and speech_prob > 0.4
+        # 综合判断：超过鼠标阀值 且（VAD 高概率 OR VAD 不可用）
+        # 实际中 silero-vad 对背景噪声环境经常错判（iMac 内置麦更是）
+        # 默认仅按 dB 阀值判，让用户可以手动调门槛。silero 作为可选“提示”使用
+        is_active = above_threshold
         
         # 预缓冲（始终保留最近的 N 帧用于发言开头补帧）
         self._frame_count += 1
@@ -708,6 +740,7 @@ class VoiceUIMain(QMainWindow):
         
         self._build_ui()
         self._wire()
+        self._install_space_ptt()
         self._set_state("IDLE")
     
     # ---- ui ----
@@ -780,7 +813,7 @@ class VoiceUIMain(QMainWindow):
         # slider
         rl.addWidget(self._small_title("🎚  噪声阀值（越低越灵敏）"))
         self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setMinimum(-60); self.slider.setMaximum(-5)
+        self.slider.setMinimum(-60); self.slider.setMaximum(-10)
         self.slider.setValue(-40)
         self.slider.setTickPosition(QSlider.TickPosition.TicksBelow)
         self.slider.setTickInterval(5)
@@ -944,7 +977,18 @@ class VoiceUIMain(QMainWindow):
         self.worker.set_listening(on)
         if on:
             self._set_state("IDLE")
-            self._append("系统", "🎙 语音已开启 — 我开始听你说话", "#80c0ff")
+            self._append("系统", "🎙 正在校准环境噪声…", "#80c0ff")
+            # 后台自动校准：以环境噪声 p95 + 6dB 作阈值
+            def _calib():
+                res = self.worker.calibrate(1.5)
+                if res and res[0] is not None:
+                    thr, p95 = res
+                    self.slider.setValue(int(thr))
+                    self.thresh_lbl.setText(f"🔧 已校准：门槛={thr:+.0f} dB / 环境噪声 {p95:+.0f} dB")
+                    self._append("系统", f"🔧 校准完成：环境 {p95:+.0f} dB，门槛 {thr:+.0f} dB（可手动拉滑杆调）", "#80ffb0")
+                else:
+                    self._append("系统", "⚠ 校准失败，使用默认门槛", "#ff8080")
+            threading.Thread(target=_calib, daemon=True).start()
         else:
             self._tts.stop()
             self.worker.set_barge_in(False)
@@ -1004,6 +1048,32 @@ class VoiceUIMain(QMainWindow):
                 event.accept()
                 return
         super().keyReleaseEvent(event)
+    
+    def _install_space_ptt(self):
+        """用 QShortcut (ApplicationShortcut) 全局接管空格作为 PTT。
+        优先于原生 keyPressEvent，能绕过按钮 / 文本控件对空格的处理。"""
+        from PySide6.QtCore import QEvent
+        # Press shortcut
+        self._sp_press = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._sp_press.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._sp_press.activated.connect(self._on_ptt_press)
+        # Release shortcut：用 eventFilter 监听 KeyRelease，因为 QShortcut 不区分 press/release
+        self.installEventFilter(self)
+    
+    def eventFilter(self, obj, event):
+        """接 KeyRelease Space，转 PTT release。
+        Press 已由 QShortcut 处理。"""
+        from PySide6.QtCore import QEvent as _QE
+        if event.type() == _QE.Type.KeyRelease:
+            ev = event  # type: QKeyEvent
+            if (ev.key() == Qt.Key.Key_Space
+                and not ev.isAutoRepeat()
+                and not self._is_text_input_focused()
+                and self._ptt_active):
+                self._on_ptt_release()
+                ev.accept()
+                return False
+        return super().eventFilter(obj, event)
     
     def _on_interrupt(self):
         if self._state != "AI_SPEAKING":
