@@ -116,6 +116,10 @@ class AudioWorker(QThread):
         # Whisper 模型懒加载
         self._whisper: WhisperModel | None = None
         self._whisper_lock = threading.Lock()
+        # mlx-whisper (更优 partial 引擎)
+        self._mlx_whisper_lib = None
+        self._mlx_ok = False
+        self._mlx_whisper_done = False
         # 内部缓冲
         self._pre_buf  : list[np.ndarray] = []   # 发言前的预缓冲
         self._speech_buf: list[np.ndarray] = []
@@ -565,10 +569,13 @@ class AudioWorker(QThread):
         return text or ""
 
     def _partial_stt_loop(self):
-        """后台 partial STT：每 2s 对最近 1.2s 音频转一次，emit partial_text。"""
+        """后台 partial STT：每 1.2s 对最近 ~1.2s 音频转一次，emit partial_text。
+        选最块的模型：优先 mlx-whisper tiny (Apple Silicon GPU)，以 faster-whisper turbo 作 fallback。
+        """
         import math
-        PARTIAL_INTERVAL = 2.0
-        PARTIAL_WINDOW = 20  # 帧数×512/16000 ~ 0.6s
+        PARTIAL_INTERVAL = 1.2  # 1.2s 刷新
+        PARTIAL_WINDOW = 24     # 0.75s @ 16kHz
+        PARTIAL_MIN_BYTES = 8000  # > 0.5s
         while True:
             with self._partial_lock:
                 if not self._partial_running:
@@ -577,31 +584,71 @@ class AudioWorker(QThread):
             with self._lock:
                 if not self._speech_active or not self._speech_buf:
                     continue
-                buf_copy = list(self._speech_buf[-PARTIAL_WINDOW:])
-            if len(buf_copy) < 4:
+                tail = list(self._speech_buf[-PARTIAL_WINDOW:])
+                head = list(self._pre_buf)
+                buf_copy = (head + tail)[-PARTIAL_WINDOW - len(head):]
+            if not buf_copy or sum(len(c) for c in buf_copy) < PARTIAL_MIN_BYTES:
                 continue
             audio = np.concatenate(buf_copy).astype(np.float32)
             rms = float(np.sqrt(np.mean(audio * audio)) + 1e-10)
             db = 20 * math.log10(rms)
             with self._lock:
-                if db < self.threshold_db - 3:
-                    continue
+                thr = self.threshold_db
+            if db < thr - 6:  # 太安静不出 (防 hallucination)
+                continue
+            text = ""
             try:
-                with self._whisper_lock:
-                    if self._whisper is None:
-                        self._whisper = WhisperModel(
-                            "turbo", device="cpu", compute_type="int8",
-                        )
-                        self.model_ready.emit()
-                segments, _ = self._whisper.transcribe(
-                    audio, language="zh", beam_size=1,
-                    vad_filter=False, without_timestamps=True,
-                )
-                text = "".join(s.text for s in segments).strip()
-                if text:
-                    self.partial_text.emit(text)
-            except Exception:
-                pass
+                text = self._mlx_partial(audio) or self._turbo_partial(audio)
+            except Exception as e:
+                self.error.emit(f"partial STT: {e}")
+            text = (text or "").strip()
+            if text and text != getattr(self, "_last_partial_text", ""):
+                self._last_partial_text = text
+                self.partial_text.emit(text)
+
+    def _mlx_partial(self, audio: np.ndarray) -> str:
+        """最优：Apple Silicon 上 mlx-whisper tiny GPU 加速。"""
+        if self._mlx_whisper_done:
+            return self._mlx_whisper_text(audio) if self._mlx_ok else ""
+        try:
+            import mlx_whisper as mw  # type: ignore
+            self._mlx_whisper_lib = mw
+            self._mlx_ok = True
+            self._mlx_whisper_done = True
+        except Exception:
+            self._mlx_ok = False
+            self._mlx_whisper_done = True
+            return ""
+        return self._mlx_whisper_text(audio)
+
+    def _mlx_whisper_text(self, audio: np.ndarray) -> str:
+        try:
+            res = self._mlx_whisper_lib.transcribe(
+                audio, language="zh",
+                path_or_hf_repo="mlx-community/whisper-tiny-mlx",
+            )
+            return (res.get("text") or "").strip()
+        except Exception as e:
+            self.error.emit(f"mlx STT: {e}")
+            return ""
+
+    def _turbo_partial(self, audio: np.ndarray) -> str:
+        """fallback：faster-whisper turbo。看 size 调 beam。"""
+        try:
+            with self._whisper_lock:
+                if self._whisper is None:
+                    self._whisper = WhisperModel(
+                        "turbo", device="cpu", compute_type="int8",
+                    )
+                    self.model_ready.emit()
+            segs, _ = self._whisper.transcribe(
+                audio, language="zh", beam_size=1,
+                vad_filter=False, without_timestamps=True,
+            )
+            return "".join(s.text for s in segs).strip()
+        except Exception as e:
+            self.error.emit(f"turbo STT: {e}")
+            return ""
 
     def prewarm_whisper(self):
         """后台预热模型，避免首次 STT 时才加载造成冷启动跳跃"""

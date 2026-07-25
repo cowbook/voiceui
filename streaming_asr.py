@@ -22,15 +22,37 @@ import json
 import os
 import sys
 import threading
+import time
 import uuid
 from typing import Optional, Callable
 
 import numpy as np
 import websockets
 
+# 打开看协议调试；可可关
+DEBUG = bool(os.environ.get("VOICEUI_DEBUG_STREAM", "0") == "1")
+
 API_KEY_ENV = "DASHSCOPE_API_KEY"
 WS_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 MODEL_REALTIME = "paraformer-realtime-v2"
+
+
+def _extract_text(sent) -> str:
+    """Aliyun Paraformer-Realtime 的 sentence 字段：可能为 dict、list of dicts、嵌套结构。
+    返回所有 text 拼接。"""
+    if isinstance(sent, dict):
+        return sent.get("text", "") or ""
+    if isinstance(sent, list):
+        out = []
+        for item in sent:
+            if isinstance(item, dict):
+                t = item.get("text", "")
+                if t:
+                    out.append(t)
+            elif isinstance(item, str):
+                out.append(item)
+        return "".join(out)
+    return ""
 
 
 class AliyunStreamingASR:
@@ -66,6 +88,9 @@ class AliyunStreamingASR:
         self.on_partial = on_partial or (lambda t: None)
         self.on_final = on_final or (lambda t: None)
         self.on_error = on_error or (lambda e: None)
+        # 音频发送队列 + 持续排水循环（避免丢弃帧）
+        self._send_q: asyncio.Queue = None  # asyncio.Queue 在 _main() 里创建
+        self._send_task: Optional[asyncio.Future] = None
         self._task_id = uuid.uuid4().hex
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -135,8 +160,17 @@ class AliyunStreamingASR:
                 }
                 await ws.send(json.dumps(msg))
                 self._ready_event.set()
+                # 启动 _send_loop + 准备 asyncio.Queue
+                self._send_q = asyncio.Queue(maxsize=4000)  # ~25s @16k
+                self._send_task = asyncio.create_task(self._send_loop(ws))
                 # 接收循环
                 async for raw in ws:
+                    if DEBUG:
+                        snippet = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+                        if len(snippet) < 800:
+                            print(f"[raw] {snippet!r}", flush=True)
+                        else:
+                            print(f"[raw] {snippet[:400]!r}...{snippet[-200:]!r}", flush=True)
                     try:
                         msg = json.loads(raw)
                     except Exception:
@@ -148,27 +182,25 @@ class AliyunStreamingASR:
                     if evt == "task-started":
                         self._started_event.set()
                     elif evt == "result-generated":
+                        # sentence 可以是 list of sentence objects 或 dict
                         out = msg.get("payload", {}).get("output", {}) or {}
-                        sent = out.get("sentence", {}) or {}
-                        text = sent.get("text", "")
+                        sent = out.get("sentence")
+                        text = self._extract_text(sent)
                         if text and text != self._last_partial:
                             self._last_partial = text
                             try:
                                 self.on_partial(text)
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                if DEBUG: print(f"[partial err] {e}", flush=True)
                     elif evt == "task-finished":
                         out = msg.get("payload", {}).get("output", {}) or {}
                         sents = out.get("sentence", [])
-                        if isinstance(sents, list):
-                            text = "".join(s.get("text", "") for s in sents)
-                        else:
-                            text = (sents or {}).get("text", "") if isinstance(sents, dict) else ""
+                        text = _extract_text(sents)
                         self._final_text = text
                         try:
                             self.on_final(text)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            if DEBUG: print(f"[final err] {e}", flush=True)
                         self._finished_event.set()
                         break
                     elif evt == "task-failed":
@@ -187,27 +219,77 @@ class AliyunStreamingASR:
             self._ready_event.set()  # 让 start() 返回
     
     def feed(self, pcm_bytes: bytes):
-        """送一段 PCM 音频（16-bit signed LE mono）"""
-        if not self._loop or not self._ws:
+        """送一段 PCM 音频（16-bit signed LE mono）—— 入队，不阻塞。"""
+        if not self._loop or self._ws is None:
+            if DEBUG: print(f"[feed] skip (loop/ws 未就绪): {len(pcm_bytes) if pcm_bytes else 0}B", flush=True)
+            return
+        if not pcm_bytes:
             return
         try:
-            asyncio.run_coroutine_threadsafe(self._send_pcm(pcm_bytes), self._loop)
-        except Exception:
+            self._send_q.put_nowait(bytes(pcm_bytes))
+            if DEBUG: print(f"[feed] qsize={self._send_q.qsize()}, +{len(pcm_bytes)}B", flush=True)
+        except queue.Full:
             pass
-    
-    async def _send_pcm(self, pcm):
-        if self._ws:
-            # 明确走 binary 帧，server 才知道这是音频
-            await self._ws.send(pcm, text=False)
+
+    async def _send_loop(self, ws):
+        """持续从 asyncio.Queue 取 PCM发送。"""
+        bytes_per_sec = self.sample_rate * 2
+        if DEBUG: print(f"[send_loop] start qsize={self._send_q.qsize()}", flush=True)
+        try:
+            sent_total = 0
+            frame_count = 0
+            consecutive_err = 0
+            while True:
+                try:
+                    chunk = await self._send_q.get()
+                except asyncio.CancelledError:
+                    break
+                t0 = time.time()
+                # websockets 16.x：bytes → binary 帧
+                try:
+                    await ws.send(chunk)
+                except Exception as e:
+                    consecutive_err += 1
+                    if DEBUG: print(f"[send err #{consecutive_err}] {type(e).__name__}: {e!r}", flush=True)
+                    if consecutive_err >= 5:
+                        raise
+                    await asyncio.sleep(0.05)
+                    continue
+                consecutive_err = 0
+                sent_total += len(chunk)
+                frame_count += 1
+                if DEBUG and (frame_count <= 5 or frame_count % 10 == 0):
+                    print(f"[send_loop] #{frame_count} sent={sent_total}B qsize={self._send_q.qsize()}", flush=True)
+                # Pacing
+                elapsed = time.time() - t0
+                expected = len(chunk) / bytes_per_sec
+                if expected > elapsed:
+                    await asyncio.sleep(expected - elapsed)
+        except asyncio.CancelledError:
+            if DEBUG: print(f"[send_loop] cancelled (sent {sent_total}B in {frame_count} frames)", flush=True)
+        except Exception as e:
+            if DEBUG: print(f"[send_loop err] {e}", flush=True)
     
     def finish(self, timeout_s: float = 30.0) -> str:
         """结束会话 + 拿最终结果（阻塞）"""
         if not self._loop or not self._ws:
             return ""
+        # 1) 停 send_loop
+        async def _cleanup():
+            if self._send_task and not self._send_task.done():
+                self._send_task.cancel()
+                try: await self._send_task
+                except Exception: pass
+        try:
+            asyncio.run_coroutine_threadsafe(_cleanup(), self._loop).result(timeout=2)
+        except Exception:
+            pass
+        # 2) 发 finish
         try:
             asyncio.run_coroutine_threadsafe(self._send_finish(), self._loop).result(timeout=5)
         except Exception as e:
             self._error_str = str(e)
+            if DEBUG: print(f"[finish err] {e}", flush=True)
         # 等 final
         self._finished_event.wait(timeout=timeout_s)
         return self._final_text
