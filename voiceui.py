@@ -129,6 +129,10 @@ class AudioWorker(QThread):
         self.cloud_provider = None
         self._cloud = None
         self._cloud_lock = threading.Lock()
+        # 云端实时 ASR session（不占云 REST 限额；首选 hybrid / cloud 模式）
+        self._stream_session = None
+        self._stream_final_text: str = ""
+        self._stream_final_lock = threading.Lock()
         self._silence_count = 0
         self._speech_frames = 0
         self._frame_count = 0
@@ -223,6 +227,8 @@ class AudioWorker(QThread):
                 self._speech_active = False
                 self._speech_buf.clear()
                 self.stop_partial_stt()
+                # 云端 session 也要结束
+                self._stop_cloud_stream()
                 return False
             audio = np.concatenate(self._speech_buf)
             self._speech_buf.clear()
@@ -230,6 +236,12 @@ class AudioWorker(QThread):
             self._silence_count = 0
             self._speech_frames = 0
         self.stop_partial_stt()
+        # 云端：先 拿 stream_final_text（调用 stop session 需点击几秒）
+        cloud_text = self._stop_cloud_stream()
+        if cloud_text:
+            self.user_text_ready.emit(cloud_text)
+            self.speech_ended.emit()
+            return True
         self.speech_ended.emit()
         threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
         return True
@@ -317,6 +329,7 @@ class AudioWorker(QThread):
                     self._speech_frames = 0
                     self._speech_buf = list(self._pre_buf)
                     self.start_partial_stt()
+                    self._start_cloud_stream()
                     self.speech_started.emit()
                 self._speech_buf.append(audio.copy())
                 self._speech_frames += 1
@@ -354,6 +367,7 @@ class AudioWorker(QThread):
                 self._speech_frames = 0
                 self._speech_buf = list(self._pre_buf)
                 self.start_partial_stt()
+                self._start_cloud_stream()
                 self.speech_started.emit()
             self._speech_buf.append(audio.copy())
             self._speech_frames += 1
@@ -383,8 +397,17 @@ class AudioWorker(QThread):
     
     def _transcribe(self, audio: np.ndarray):
         """最终转写：根据 self.asr_mode 选 在线 / 本地 / hybrid。
-        hybrid 默认：partial 走本地（快），final 走云端（准）。
+        注意：如果 _stop_cloud_stream 前面已经在主线程拿到 final text，则 _transcribe 不多走一趟。
         """
+        # 检查云端 stream final 是否已拿到
+        with self._stream_final_lock:
+            stream_final = self._stream_final_text
+            # 清空，避免影响下一次
+            self._stream_final_text = ""
+        if stream_final and self.asr_mode in ("cloud", "hybrid"):
+            self.user_text_ready.emit(stream_final)
+            return
+        
         text = ""
         err = None
         if self.asr_mode in ("cloud", "hybrid"):
@@ -432,6 +455,44 @@ class AudioWorker(QThread):
     def stop_partial_stt(self):
         with self._partial_lock:
             self._partial_running = False
+
+    def _start_cloud_stream(self):
+        """如果 asr_mode 含 cloud，开一个实时 ASR session（不占云 REST 限额）。"""
+        if self.asr_mode not in ("cloud", "hybrid"):
+            return
+        if self._stream_session is not None:
+            return
+        try:
+            from streaming_asr import AliyunStreamingASR
+            sess = AliyunStreamingASR(
+                on_partial=lambda t: self.partial_text.emit(t),
+                on_final=lambda t: self._on_stream_final(t),
+                on_error=lambda e: None,
+            )
+            sess.start()  # 阻塞到 task-started
+            self._stream_session = sess
+        except Exception:
+            self._stream_session = None
+
+    def _on_stream_final(self, text: str):
+        with self._stream_final_lock:
+            self._stream_final_text = text
+
+    def _stop_cloud_stream(self) -> str:
+        """结束 stream session，拿 final 文本。"""
+        if self._stream_session is None:
+            return ""
+        sess = self._stream_session
+        self._stream_session = None
+        try:
+            text = sess.finish(timeout_s=15)
+        except Exception:
+            text = ""
+        with self._stream_final_lock:
+            if text and not self._stream_final_text:
+                self._stream_final_text = text
+            return self._stream_final_text
+        return text or ""
 
     def _partial_stt_loop(self):
         """后台 partial STT：每 2s 对最近 1.2s 音频转一次，emit partial_text。"""
