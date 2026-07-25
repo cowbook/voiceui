@@ -67,6 +67,12 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 SESSION_KEY = "agent:main:voiceui"   # 持久化语音 session（与 webchat 隔离）
 DEFAULT_MODEL = "minimax/MiniMax-M3" # 默认模型（与 webchat 同源）
 
+# TTS 默认值
+TTS_BACKEND_DEFAULT = "edge"     # "edge" 在线 / "say" 本地
+EDGE_VOICE_DEFAULT  = "zh-CN-XiaoxiaoNeural"
+SAY_VOICE_DEFAULT   = "Tingting"
+SAY_RATE_DEFAULT    = "200"
+
 # Audio
 SAMPLE_RATE    = 16_000
 FRAME_SAMPLES  = 512                 # silero-vad 要求 16kHz 下 512/1024/1536
@@ -392,34 +398,27 @@ class AvatarWidget(QWidget):
         p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
 
 
-# --- TTS driver --------------------------------------------------------------
+# --- TTS drivers -------------------------------------------------------------
 
-class TTSDriver(QObject):
-    """包装 macOS `say`：可被 SIGTERM 杀掉以实现双工打断"""
+class _TTSBase(QObject):
+    """TTS 驱动接口。所有驱动实现同协议：speak/stop/is_speaking"""
     
-    def __init__(self, voice: str = TTS_VOICE, rate: str = TTS_RATE):
+    def __init__(self):
         super().__init__()
-        self.voice = voice
-        self.rate  = rate
-        self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
     
-    def speak(self, text: str):
-        with self._lock:
-            # 先把上一次的停掉
-            self._kill_locked()
-            if not text.strip():
-                return
-            # 启动新的
+    def _kill_locked(self):
+        if self._proc and self._proc.poll() is None:
             try:
-                self._proc = subprocess.Popen(
-                    ["say", "-v", self.voice, "-r", self.rate, text],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except Exception as e:
-                print(f"[TTS] 启动失败: {e}", file=sys.stderr)
-                self._proc = None
+                import os, signal as _sig
+                os.killpg(self._proc.pid, _sig.SIGTERM)
+            except Exception:
+                try: self._proc.terminate()
+                except Exception: pass
+            try: self._proc.wait(timeout=0.5)
+            except Exception: pass
+        self._proc = None
     
     def stop(self):
         with self._lock:
@@ -427,20 +426,111 @@ class TTSDriver(QObject):
     
     def is_speaking(self) -> bool:
         with self._lock:
+            # 生成阶段 也视为“还在说话” — 看护轮询需要这个
+            if not self._gen_done.is_set():
+                return True
             return self._proc is not None and self._proc.poll() is None
     
-    def _kill_locked(self):
-        if self._proc and self._proc.poll() is None:
+    def speak(self, text: str):
+        raise NotImplementedError
+
+
+class SayTTSDriver(_TTSBase):
+    """本地 fallback：macOS `say`，可被 SIGTERM 杀掉以实现双工打断"""
+    
+    def __init__(self, voice: str = TTS_VOICE, rate: str = TTS_RATE):
+        super().__init__()
+        self.voice = voice
+        self.rate  = rate
+    
+    def speak(self, text: str):
+        with self._lock:
+            self._kill_locked()
+            if not text.strip():
+                return
             try:
-                # 用 process group kill，保证 say 的子进程也死
-                import os
-                os.killpg(self._proc.pid, signal.SIGTERM)
-            except Exception:
-                try: self._proc.terminate()
-                except Exception: pass
-            try: self._proc.wait(timeout=0.5)
-            except Exception: pass
-        self._proc = None
+                self._proc = subprocess.Popen(
+                    ["say", "-v", self.voice, "-r", self.rate, text],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as e:
+                print(f"[SayTTS] 启动失败: {e}", file=sys.stderr)
+                self._proc = None
+
+
+class EdgeTTSDriver(_TTSBase):
+    """在线 TTS：Microsoft Edge neural voices（免费、免 key、中文超自然）
+    
+    默认 zh-CN-XiaoxiaoNeural：年轻女声、活泼自然，超级貼合海绵宝宝风格。
+    备选：YunxiNeural（男）、XiaoyiNeural（暖女）、YunyangNeural（播音）、XiaobeiNeural（东北）、XiaoniNeural（陕）。
+    """
+    
+    SUPPORTED_VOICES = [
+        "zh-CN-XiaoxiaoNeural",   # 女 / 活泼甜 → 默认
+        "zh-CN-YunxiNeural",      # 男 / 有诉诸热情
+        "zh-CN-XiaoyiNeural",     # 女 / 暖
+        "zh-CN-YunyangNeural",    # 男 / 播报
+        "zh-CN-YunjianNeural",    # 男 / 温和
+        "zh-CN-liaoning-XiaobeiNeural",  # 东北女
+        "zh-CN-shaanxi-XiaoniNeural",    # 陕西女
+    ]
+    
+    def __init__(self, voice: str = "zh-CN-XiaoxiaoNeural", rate: str = "+0%", volume: str = "+0%"):
+        super().__init__()
+        self.voice = voice
+        self.rate = rate      # 如 "+10%"、"-20%"
+        self.volume = volume  # 如 "+5%"、"-10%"
+        self._tmpfile = "/tmp/voiceui_edge_tts.mp3"
+        self._gen_thread: threading.Thread | None = None
+        self._gen_done = threading.Event()
+        self._gen_done.set()  # 初始：有生成义务吗？没有
+    
+    def speak(self, text: str):
+        with self._lock:
+            self._kill_locked()
+            if not text.strip():
+                return
+            # 等上一次生成结束，避免覆写
+            self._gen_done.clear()
+        # 生成 + 播放 都在后台线程
+        threading.Thread(target=self._run, args=(text,), daemon=True).start()
+    
+    def _run(self, text: str):
+        try:
+            # 1) 在线合成
+            import asyncio
+            import edge_tts
+            async def gen():
+                communicate = edge_tts.Communicate(
+                    text, voice=self.voice, rate=self.rate, volume=self.volume,
+                )
+                with open(self._tmpfile, "wb") as f:
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            f.write(chunk["data"])
+            asyncio.run(gen())
+        except Exception as e:
+            print(f"[EdgeTTS] 合成失败: {e}", file=sys.stderr)
+            with self._lock:
+                self._gen_done.set()
+            return
+        # 2) 播放
+        with self._lock:
+            self._gen_done.set()
+            try:
+                self._proc = subprocess.Popen(
+                    ["afplay", self._tmpfile],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as e:
+                print(f"[EdgeTTS] afplay 失败: {e}", file=sys.stderr)
+                self._proc = None
+
+
+# 旧名兼容：默认使用 EdgeTTS（云端、中文超自然）
+TTSDriver = EdgeTTSDriver
 
 
 # --- Agent backend -----------------------------------------------------------
@@ -508,14 +598,18 @@ class VoiceUIMain(QMainWindow):
         "ERROR":         "⚠️  出错了",
     }
     
-    def __init__(self):
+    def __init__(self, tts_backend: str = "edge", tts_voice: str = "zh-CN-XiaoxiaoNeural"):
         super().__init__()
         self.setWindowTitle("🧽 海绵宝宝 · Voice Agent")
         self.setMinimumSize(1024, 720)
         self.resize(1180, 780)
         
         self._state = "IDLE"
-        self._tts = TTSDriver()
+        # TTS backend: "edge"（在线神经语音，默认）还是 "say"（本地）
+        if tts_backend == "say":
+            self._tts = SayTTSDriver()
+        else:
+            self._tts = EdgeTTSDriver(voice=tts_voice)
         self._agent = AgentBackend()
         
         self._build_ui()
@@ -856,14 +950,21 @@ class VoiceUIMain(QMainWindow):
 # --- Main --------------------------------------------------------------------
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tts", choices=["edge", "say"], default="edge",
+                    help="TTS 后端：edge=微软神经在线 / say=macOS 本地")
+    ap.add_argument("--voice", default="zh-CN-XiaoxiaoNeural",
+                    help="edge 模式下选声音 (zh-CN-XiaoxiaoNeural/zh-CN-YunxiNeural/...)")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help="对话模型 id")
+    args = ap.parse_args()
+    
     app = QApplication(sys.argv)
     app.setApplicationName("海绵宝宝 Voice UI")
     
-    # 字体
-    db = QFontDatabase()
-    # 系统默认中文即可，不强行加字体
-    
-    win = VoiceUIMain()
+    win = VoiceUIMain(tts_backend=args.tts, tts_voice=args.voice)
+    win._agent.model = args.model
     win.show()
     
     sys.exit(app.exec())
