@@ -124,6 +124,15 @@ class AudioWorker(QThread):
         self._speech_frames = 0
         self._frame_count = 0
         self._running = True
+        # ASR 后端选择：hybrid / cloud / local
+        self.asr_mode = "hybrid"
+        self.cloud_provider = None
+        self._cloud = None
+        self._cloud_lock = threading.Lock()
+        self._silence_count = 0
+        self._speech_frames = 0
+        self._frame_count = 0
+        self._running = True
         # PTT（Push-to-Talk）状态
         self._ptt_active = False
         self._ptt_lock = threading.Lock()
@@ -373,24 +382,43 @@ class AudioWorker(QThread):
                     self._speech_frames = 0
     
     def _transcribe(self, audio: np.ndarray):
-        try:
-            if self._whisper is None:
-                with self._whisper_lock:
-                    if self._whisper is None:
-                        # 首次加载：turbo 模型，质量/速度平衡
-                        self._whisper = WhisperModel(
-                            "turbo", device="cpu", compute_type="int8"
-                        )
-                        self.model_ready.emit()
-            segments, info = self._whisper.transcribe(
-                audio, language="zh", beam_size=5, vad_filter=False,
-            )
-            text = "".join(seg.text for seg in segments).strip()
-            if text:
-                self.user_text_ready.emit(text)
-        except Exception as e:
-            self.error.emit(f"STT 失败: {e}")
-            self.model_failed.emit(str(e))
+        """最终转写：根据 self.asr_mode 选 在线 / 本地 / hybrid。
+        hybrid 默认：partial 走本地（快），final 走云端（准）。
+        """
+        text = ""
+        err = None
+        if self.asr_mode in ("cloud", "hybrid"):
+            try:
+                if self._cloud is None:
+                    with self._cloud_lock:
+                        if self._cloud is None:
+                            from cloud_asr import cloud_asr_for, _detect_provider
+                            provider = self.cloud_provider or _detect_provider()
+                            if not provider:
+                                raise RuntimeError("没云端 key")
+                            self._cloud = cloud_asr_for(provider)
+                text = self._cloud.transcribe(audio, SAMPLE_RATE).strip()
+            except Exception as e:
+                err = f"云 {self.cloud_provider}: {e}"
+        if not text and self.asr_mode in ("local", "hybrid"):
+            try:
+                if self._whisper is None:
+                    with self._whisper_lock:
+                        if self._whisper is None:
+                            self._whisper = WhisperModel(
+                                "turbo", device="cpu", compute_type="int8"
+                            )
+                            self.model_ready.emit()
+                segments, info = self._whisper.transcribe(
+                    audio, language="zh", beam_size=5, vad_filter=False,
+                )
+                text = "".join(seg.text for seg in segments).strip()
+            except Exception as e:
+                err = err or f"本地 Whisper: {e}"
+        if text:
+            self.user_text_ready.emit(text)
+        elif err:
+            self.error.emit(f"STT 失败: {err}")
     
     def start_partial_stt(self):
         """发言期间背景跳 2 秒一次的实时识别。"""
@@ -1280,6 +1308,11 @@ def main():
                     help="edge 模式下选声音 (zh-CN-XiaoxiaoNeural/zh-CN-YunxiNeural/...)")
     ap.add_argument("--model", default=DEFAULT_MODEL,
                     help="对话模型 id")
+    ap.add_argument("--asr", choices=["hybrid", "cloud", "local"], default="hybrid",
+                    help="ASR 模式：hybrid=partial 本地 + final 云端（默认），"
+                         "cloud=全云端，local=全本地 Whisper")
+    ap.add_argument("--cloud-provider", choices=["aliyun", "openai"], default=None,
+                    help="强制云端 provider (默认看环境变量)")
     args = ap.parse_args()
     
     app = QApplication(sys.argv)
@@ -1287,6 +1320,8 @@ def main():
     
     win = VoiceUIMain(tts_backend=args.tts, tts_voice=args.voice)
     win._agent.model = args.model
+    win.worker.asr_mode = args.asr
+    win.worker.cloud_provider = args.cloud_provider
     win.show()
     
     sys.exit(app.exec())
