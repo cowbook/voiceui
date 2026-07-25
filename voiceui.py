@@ -99,6 +99,7 @@ class AudioWorker(QThread):
     level_changed       = Signal(float)  # 0..1 归一化音量（用于波形/电平）
     speech_started      = Signal()
     speech_ended        = Signal()
+    partial_text        = Signal(str)    # 实时字幕（每 2s 更新）
     user_text_ready     = Signal(str)
     interrupt_detected  = Signal()
     model_ready         = Signal()       # Whisper 加载完
@@ -126,6 +127,9 @@ class AudioWorker(QThread):
         # PTT（Push-to-Talk）状态
         self._ptt_active = False
         self._ptt_lock = threading.Lock()
+        # Partial STT（实时字幕）状态
+        self._partial_running = False
+        self._partial_lock = threading.Lock()
         # Silero VAD（v6 API）
         try:
             self._vad_model = load_silero_vad()
@@ -197,6 +201,7 @@ class AudioWorker(QThread):
             self._speech_buf.clear()
             self._silence_count = 0
             self._speech_frames = 0
+        self.start_partial_stt()  # PTT 也上实时字幕
     
     def end_ptt(self) -> bool:
         """松开：立刻把当前 buf 送 STT
@@ -208,12 +213,14 @@ class AudioWorker(QThread):
             if not self._speech_active or not self._speech_buf:
                 self._speech_active = False
                 self._speech_buf.clear()
+                self.stop_partial_stt()
                 return False
             audio = np.concatenate(self._speech_buf)
             self._speech_buf.clear()
             self._speech_active = False
             self._silence_count = 0
             self._speech_frames = 0
+        self.stop_partial_stt()
         self.speech_ended.emit()
         threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
         return True
@@ -300,6 +307,7 @@ class AudioWorker(QThread):
                     self._silence_count = 0
                     self._speech_frames = 0
                     self._speech_buf = list(self._pre_buf)
+                    self.start_partial_stt()
                     self.speech_started.emit()
                 self._speech_buf.append(audio.copy())
                 self._speech_frames += 1
@@ -336,6 +344,7 @@ class AudioWorker(QThread):
                 self._silence_count = 0
                 self._speech_frames = 0
                 self._speech_buf = list(self._pre_buf)
+                self.start_partial_stt()
                 self.speech_started.emit()
             self._speech_buf.append(audio.copy())
             self._speech_frames += 1
@@ -351,6 +360,7 @@ class AudioWorker(QThread):
                     if duration_frames >= MIN_SPEECH_FRAMES:
                         audio_segment = np.concatenate(self._speech_buf)
                         self._speech_buf.clear()
+                        self.stop_partial_stt()
                         self.speech_ended.emit()
                         # STT 在工作线程跑（避免阻塞 callback）
                         threading.Thread(
@@ -382,6 +392,58 @@ class AudioWorker(QThread):
             self.error.emit(f"STT 失败: {e}")
             self.model_failed.emit(str(e))
     
+    def start_partial_stt(self):
+        """发言期间背景跳 2 秒一次的实时识别。"""
+        with self._partial_lock:
+            if self._partial_running:
+                return
+            self._partial_running = True
+        t = threading.Thread(target=self._partial_stt_loop, daemon=True)
+        t.start()
+
+    def stop_partial_stt(self):
+        with self._partial_lock:
+            self._partial_running = False
+
+    def _partial_stt_loop(self):
+        """后台 partial STT：每 2s 对最近 1.2s 音频转一次，emit partial_text。"""
+        import math
+        PARTIAL_INTERVAL = 2.0
+        PARTIAL_WINDOW = 20  # 帧数×512/16000 ~ 0.6s
+        while True:
+            with self._partial_lock:
+                if not self._partial_running:
+                    return
+            time.sleep(PARTIAL_INTERVAL)
+            with self._lock:
+                if not self._speech_active or not self._speech_buf:
+                    continue
+                buf_copy = list(self._speech_buf[-PARTIAL_WINDOW:])
+            if len(buf_copy) < 4:
+                continue
+            audio = np.concatenate(buf_copy).astype(np.float32)
+            rms = float(np.sqrt(np.mean(audio * audio)) + 1e-10)
+            db = 20 * math.log10(rms)
+            with self._lock:
+                if db < self.threshold_db - 3:
+                    continue
+            try:
+                with self._whisper_lock:
+                    if self._whisper is None:
+                        self._whisper = WhisperModel(
+                            "turbo", device="cpu", compute_type="int8",
+                        )
+                        self.model_ready.emit()
+                segments, _ = self._whisper.transcribe(
+                    audio, language="zh", beam_size=1,
+                    vad_filter=False, without_timestamps=True,
+                )
+                text = "".join(s.text for s in segments).strip()
+                if text:
+                    self.partial_text.emit(text)
+            except Exception:
+                pass
+
     def prewarm_whisper(self):
         """后台预热模型，避免首次 STT 时才加载造成冷启动跳跃"""
         def _go():
@@ -776,6 +838,32 @@ class VoiceUIMain(QMainWindow):
         self.avatar = AvatarWidget(AVATAR)
         ll.addWidget(self.avatar, alignment=Qt.AlignmentFlag.AlignCenter)
         
+        # 实时字幕：有内容时亮 + 描边变色；无内容时灰提示
+        self.live_caption = QLabel("🗣  说话中…实时字幕会在这里跳字")
+        self.live_caption.setWordWrap(True)
+        self.live_caption.setMinimumHeight(48)
+        self.live_caption.setMaximumHeight(96)
+        self.live_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.live_caption.setStyleSheet("""
+            QLabel {
+                background: rgba(10, 18, 32, 220);
+                border: 1px solid #1a4060;
+                border-radius: 8px;
+                padding: 8px 14px;
+                color: #80a0c0;
+                font-size: 14px;
+                font-family: 'PingFang SC','Microsoft YaHei';
+            }
+            QLabel[live="true"] {
+                background: rgba(20, 50, 80, 220);
+                border-color: #50c0ff;
+                color: #ffffff;
+                font-size: 15px;
+            }
+        """)
+        self.live_caption.setProperty("live", False)
+        ll.addWidget(self.live_caption)
+        
         wave_title = QLabel("◉  LIVE  WAVEFORM")
         wave_title.setStyleSheet("color:#5090c0; font-size:10px; letter-spacing:3px; padding-left:6px;")
         ll.addWidget(wave_title)
@@ -927,7 +1015,10 @@ class VoiceUIMain(QMainWindow):
         
         self.worker.level_changed.connect(self._on_level)
         self.worker.speech_started.connect(lambda: self._set_state("USER_SPEAKING"))
+        self.worker.speech_started.connect(self._on_speech_started)
         self.worker.speech_ended.connect(lambda: self._set_state("TRANSCRIBING"))
+        self.worker.speech_ended.connect(self._on_speech_ended)
+        self.worker.partial_text.connect(self._on_partial_text)
         self.worker.user_text_ready.connect(self._on_user_text)
         self.worker.interrupt_detected.connect(self._on_interrupt)
         self.worker.error.connect(lambda e: self._set_state("ERROR") or self.statusBar().showMessage(e))
@@ -1086,7 +1177,30 @@ class VoiceUIMain(QMainWindow):
         # ⚠️ 不要重置 _speech_active / _speech_buf
         # ——barge 模式已在累积，normal 模式会无缝接管
     
+    def _on_speech_started(self):
+        self.live_caption.setProperty("live", True)
+        self.live_caption.setText("🗣  · · · · ·")
+        self.live_caption.style().unpolish(self.live_caption)
+        self.live_caption.style().polish(self.live_caption)
+    
+    def _on_speech_ended(self):
+        self.live_caption.setProperty("live", False)
+        self.live_caption.setText("🧠  送 STT 转写中…")
+        self.live_caption.style().unpolish(self.live_caption)
+        self.live_caption.style().polish(self.live_caption)
+    
+    def _on_partial_text(self, text: str):
+        self.live_caption.setText(f"🗣 {text}")
+        self.live_caption.setProperty("live", True)
+        self.live_caption.style().unpolish(self.live_caption)
+        self.live_caption.style().polish(self.live_caption)
+    
     def _on_user_text(self, text: str):
+        # reset 实况字幕，送 agent
+        self.live_caption.setProperty("live", False)
+        self.live_caption.setText("🎤  待命")
+        self.live_caption.style().unpolish(self.live_caption)
+        self.live_caption.style().polish(self.live_caption)
         self._append("蟹老板", text, "#80ffb0")
         self._set_state("THINKING")
         self._agent.ask(text)
