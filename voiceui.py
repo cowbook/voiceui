@@ -129,6 +129,15 @@ class AudioWorker(QThread):
         self.cloud_provider = None
         self._cloud = None
         self._cloud_lock = threading.Lock()
+        # 云端实时 ASR session
+        self._stream_session = None
+        self._stream_final_text: str = ""
+        self._stream_final_lock = threading.Lock()
+        # TTS 生命周期：用于防自听
+        self._tts_active = False
+        self._tts_start_ts = 0.0
+        self._tts_end_ts = 0.0
+        self._tts_lock = threading.Lock()
         # 云端实时 ASR session（不占云 REST 限额；首选 hybrid / cloud 模式）
         self._stream_session = None
         self._stream_final_text: str = ""
@@ -202,6 +211,47 @@ class AudioWorker(QThread):
         with self._lock:
             self.barge_in = bool(on)
 
+    def tts_started(self):
+        """TTS 主动播音开始时调——抬高门限 +10dB 起防自听。"""
+        with self._tts_lock:
+            self._tts_active = True
+            self._tts_start_ts = time.time()
+            self._tts_end_ts = 0.0
+            # 清旧 buf，防 session 残留
+            with self._lock:
+                self._speech_active = False
+                self._speech_buf.clear()
+                self._pre_buf.clear()
+                self._silence_count = 0
+                self._speech_frames = 0
+        self.stop_partial_stt()
+
+    def tts_ended(self, keep_buf: bool = False):
+        """TTS 结束（自然 / 被打断）调用——清 buf + 标记尾回声窗口。
+        keep_buf=True：保留 buf（barge-in 用户打断场景，buf 是用户说话），
+        keep_buf=False：默认 (自然结束)，buf 绝对是 echo，必须清。
+        """
+        with self._tts_lock:
+            self._tts_active = False
+            self._tts_end_ts = time.time()
+        with self._lock:
+            if not keep_buf:
+                self._speech_active = False
+                self._speech_buf.clear()
+            self._pre_buf.clear()
+            self._silence_count = 0
+            self._speech_frames = 0
+        self.stop_partial_stt()
+    
+    def is_in_echo_window(self) -> bool:
+        """True：TTS 刚开始 600ms 内，或刚结束 600ms 内——这些时段不 capture。"""
+        import time as _t
+        if self._tts_active and (_t.time() - self._tts_start_ts) < 0.6:
+            return True
+        if self._tts_end_ts > 0 and (_t.time() - self._tts_end_ts) < 0.6:
+            return True
+        return False
+    
     def start_ptt(self):
         """按住发言：启动 PTT 捕获（必须同时 listenting）"""
         with self._ptt_lock:
@@ -291,8 +341,23 @@ class AudioWorker(QThread):
             listening_on = self.listening_on
             barge_in     = self.barge_in
         
-        # 是否超过门限（鼠标可调）
-        above_threshold = db > threshold_db
+        # TTS 防自听：播放期间抬高门限，去掉首尾回声
+        effective_threshold = threshold_db
+        with self._tts_lock:
+            tts_active = self._tts_active
+            tts_start = self._tts_start_ts
+            tts_end   = self._tts_end_ts
+        if tts_active and (time.time() - tts_start) > 0.3:
+            # TTS 主动播放中：需人声 > AI 声约 10dB
+            effective_threshold = min(threshold_db + 10.0, -5.0)
+        above_threshold = db > effective_threshold
+        # 首尾回声拦截
+        is_in_echo = (
+            (tts_active and (time.time() - tts_start) < 0.6) or
+            (tts_end > 0 and (time.time() - tts_end) < 0.6)
+        )
+        # 发 level_changed 仍让波形动，但 capture 不进 buf
+        # level 已在上面发出去了
         
         # VAD 使用 silero-vad v6（不受鼠标阈值影响，用于稳健检测）
         try:
@@ -321,6 +386,11 @@ class AudioWorker(QThread):
         # PTT 模式：最高优先级，只要按住就持续录
         with self._ptt_lock:
             ptt = self._ptt_active
+
+        # TTS 首尾回声拦截：首尾 0.6s 只走 PTT / barge-in，不入 buffer
+        if is_in_echo and not ptt:
+            return
+
         if ptt:
             if above_threshold:
                 if not self._speech_active:
@@ -1263,6 +1333,8 @@ class VoiceUIMain(QMainWindow):
         self._append("系统", "⏸ 被打断了，听你说…", "#ffa060")
         # 切换到普通捕获模式
         self.worker.set_barge_in(False)
+        # 防自听：TTS 被中断了，把 buf 里刚积累的 echo 干掉
+        self.worker.tts_ended()
         # ⚠️ 不要重置 _speech_active / _speech_buf
         # ——barge 模式已在累积，normal 模式会无缝接管
     
@@ -1296,8 +1368,9 @@ class VoiceUIMain(QMainWindow):
     
     def _on_agent_reply(self, reply: str):
         self._append("海绵宝宝", reply, "#ff90d0")
-        # 进入 AI_SPEAKING：开启 barge_in
+        # 进入 AI_SPEAKING：开启 barge_in + 通知 worker 防自听
         self.worker.set_barge_in(True)
+        self.worker.tts_started()
         self._set_state("AI_SPEAKING")
         self._tts.speak(reply)
         # 监听 TTS 是否自然结束（轮询计时器）
@@ -1305,17 +1378,15 @@ class VoiceUIMain(QMainWindow):
         self._tts_watchdog.setSingleShot(False)
         self._tts_watchdog.timeout.connect(self._check_tts_done)
         self._tts_watchdog.start(150)
-    
+
     def _check_tts_done(self):
         if self._tts.is_speaking():
             return
-        # 自然结束：退出 barge_in，回 IDLE（如果还在监听）
+        # 自然结束：退出 barge_in，清 buf（自然结束 buf 必是 echo），回 IDLE
         self._tts_watchdog.stop()
         self.worker.set_barge_in(False)
-        if self.btn_listen.isChecked():
-            self._set_state("IDLE")
-        else:
-            self._set_state("IDLE")
+        self.worker.tts_ended(keep_buf=False)
+        self._set_state("IDLE")
     
     def _set_state(self, s: str):
         self._state = s
@@ -1346,6 +1417,7 @@ class VoiceUIMain(QMainWindow):
     # ---- close ----
     def closeEvent(self, e):
         self._tts.stop()
+        self.worker.tts_ended()
         self.worker.stop()
         super().closeEvent(e)
         if self.worker.isRunning():
