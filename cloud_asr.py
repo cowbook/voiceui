@@ -88,22 +88,26 @@ class AliyunDashScopeASR(CloudASRBase):
     
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
         wav_bytes = audio_to_wav_bytes(audio, sample_rate)
-        # 写到临时文件，DashScope Recognition 从文件读
+        # 写到临时文件，DashScope Transcription 从文件读
         import tempfile
-        from dashscope.audio.asr import Recognition
+        from dashscope.audio.asr import Transcription
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             f.write(wav_bytes)
             tmp_path = f.name
         try:
-            r = Recognition.call(
+            r = Transcription.call(
                 model="paraformer-v2",
                 file_urls=[f"file://{tmp_path}"],
                 language_hints=["zh", "en"],
-                sample_rate=sample_rate,
             )
             if r.status_code == 200:
-                sentences = (r.output or {}).get("sentence", []) or []
-                return "".join(s.get("text", "") for s in sentences).strip()
+                # Transcription 返回结构：output.transcripts[].sentences[].text
+                transcripts = (r.output or {}).get("transcripts", []) or []
+                texts = []
+                for tr in transcripts:
+                    for s in tr.get("sentences", []) or []:
+                        texts.append(s.get("text", ""))
+                return "".join(texts).strip()
             else:
                 raise RuntimeError(f"Aliyun ASR 失败 {r.status_code}: {r.message}")
         finally:
