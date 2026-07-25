@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
 # --- Audio / ML ---
 import sounddevice as sd
 import silero_vad
+from silero_vad import load_silero_vad, VADIterator
 from faster_whisper import WhisperModel
 
 # --- Constants ---------------------------------------------------------------
@@ -99,6 +100,8 @@ class AudioWorker(QThread):
     speech_ended        = Signal()
     user_text_ready     = Signal(str)
     interrupt_detected  = Signal()
+    model_ready         = Signal()       # Whisper 加载完
+    model_failed        = Signal(str)    # Whisper 加载失败
     error               = Signal(str)
     
     def __init__(self):
@@ -119,6 +122,15 @@ class AudioWorker(QThread):
         self._speech_frames = 0
         self._frame_count = 0
         self._running = True
+        # PTT（Push-to-Talk）状态
+        self._ptt_active = False
+        self._ptt_lock = threading.Lock()
+        # Silero VAD（v6 API）
+        try:
+            self._vad_model = load_silero_vad()
+        except Exception as e:
+            print(f"[AudioWorker] VAD 模型加载失败: {e}", file=sys.stderr)
+            self._vad_model = None
         # 设置 stdout 不缓冲
         try: sys.stdout.reconfigure(line_buffering=True)
         except Exception: pass
@@ -142,6 +154,39 @@ class AudioWorker(QThread):
     def set_barge_in(self, on: bool):
         with self._lock:
             self.barge_in = bool(on)
+
+    def start_ptt(self):
+        """按住发言：启动 PTT 捕获（必须同时 listenting）"""
+        with self._ptt_lock:
+            self._ptt_active = True
+        with self._lock:
+            if not self.listening_on:
+                self.listening_on = True  # PTT 期间隐式开麦
+            # 清旧 buf，准备新一段
+            self._speech_active = False
+            self._speech_buf.clear()
+            self._silence_count = 0
+            self._speech_frames = 0
+    
+    def end_ptt(self) -> bool:
+        """松开：立刻把当前 buf 送 STT
+        Returns: 是否真的送去了 STT（buf 空 返回 False）
+        """
+        with self._ptt_lock:
+            self._ptt_active = False
+        with self._lock:
+            if not self._speech_active or not self._speech_buf:
+                self._speech_active = False
+                self._speech_buf.clear()
+                return False
+            audio = np.concatenate(self._speech_buf)
+            self._speech_buf.clear()
+            self._speech_active = False
+            self._silence_count = 0
+            self._speech_frames = 0
+        self.speech_ended.emit()
+        threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
+        return True
     
     def stop(self):
         self._running = False
@@ -191,10 +236,13 @@ class AudioWorker(QThread):
         # 是否超过门限（鼠标可调）
         above_threshold = db > threshold_db
         
-        # VAD 使用 silero-vad（不受鼠标阈值影响，用于稳健检测）
+        # VAD 使用 silero-vad v6（不受鼠标阈值影响，用于稳健检测）
         try:
-            speech_prob = float(silero_vad.get_speech_prob(audio, SAMPLE_RATE))
-        except Exception:
+            if self._vad_model is not None:
+                speech_prob = float(self._vad_model(audio, SAMPLE_RATE).item())
+            else:
+                speech_prob = 0.0
+        except Exception as e:
             speech_prob = 0.0
         
         # 综合判断：超过鼠标阀值 且 VAD 高概率认为是语音
@@ -209,14 +257,43 @@ class AudioWorker(QThread):
         # 模式分支
         if not listening_on:
             return
-        
+
+        # PTT 模式：最高优先级，只要按住就持续录
+        with self._ptt_lock:
+            ptt = self._ptt_active
+        if ptt:
+            if above_threshold:
+                if not self._speech_active:
+                    self._speech_active = True
+                    self._silence_count = 0
+                    self._speech_frames = 0
+                    self._speech_buf = list(self._pre_buf)
+                    self.speech_started.emit()
+                self._speech_buf.append(audio.copy())
+                self._speech_frames += 1
+                self._silence_count = 0
+            else:
+                # 静音帧：不算发言结束，还是收着
+                if self._speech_active:
+                    self._speech_buf.append(audio.copy())
+            return
+
         if barge_in:
-            # 双工模式：只检测打断，不捕获完整发言
-            if is_active and not self._speech_active:
-                self._speech_active = True
-                self.interrupt_detected.emit()
-            elif not is_active:
-                self._speech_active = False
+            # 双工模式：检测打断 + 累积语音帧，过渡到 normal 模式时不丢首音节
+            if is_active:
+                if not self._speech_active:
+                    # 第一次检测到用户声音 → 转为“捕获+打断”模式
+                    self._speech_active = True
+                    self._silence_count = 0
+                    self._speech_frames = 1
+                    self._speech_buf = list(self._pre_buf)   # 拼上预缓冲
+                    self._speech_buf.append(audio.copy())
+                    self.interrupt_detected.emit()
+                else:
+                    # 已触发，继续累积（让 GUI 来得及关 TTS）
+                    self._speech_buf.append(audio.copy())
+                    self._speech_frames += 1
+                    self._silence_count = 0
             return
         
         # 正常捕获模式
@@ -262,6 +339,7 @@ class AudioWorker(QThread):
                         self._whisper = WhisperModel(
                             "turbo", device="cpu", compute_type="int8"
                         )
+                        self.model_ready.emit()
             segments, info = self._whisper.transcribe(
                 audio, language="zh", beam_size=5, vad_filter=False,
             )
@@ -270,6 +348,20 @@ class AudioWorker(QThread):
                 self.user_text_ready.emit(text)
         except Exception as e:
             self.error.emit(f"STT 失败: {e}")
+            self.model_failed.emit(str(e))
+    
+    def prewarm_whisper(self):
+        """后台预热模型，避免首次 STT 时才加载造成冷启动跳跃"""
+        def _go():
+            try:
+                if self._whisper is None:
+                    self._whisper = WhisperModel(
+                        "turbo", device="cpu", compute_type="int8"
+                    )
+                self.model_ready.emit()
+            except Exception as e:
+                self.model_failed.emit(str(e))
+        threading.Thread(target=_go, daemon=True).start()
 
 
 # --- Custom widgets ----------------------------------------------------------
@@ -596,6 +688,7 @@ class VoiceUIMain(QMainWindow):
         "AI_SPEAKING":   "💬  海绵宝宝在回答（可以说打断）",
         "INTERRUPTED":   "⏸️  被打断，重新听",
         "ERROR":         "⚠️  出错了",
+        "INIT":          "🔥 预热模型…",
     }
     
     def __init__(self, tts_backend: str = "edge", tts_voice: str = "zh-CN-XiaoxiaoNeural"):
@@ -605,6 +698,7 @@ class VoiceUIMain(QMainWindow):
         self.resize(1180, 780)
         
         self._state = "IDLE"
+        self._ptt_active = False
         # TTS backend: "edge"（在线神经语音，默认）还是 "say"（本地）
         if tts_backend == "say":
             self._tts = SayTTSDriver()
@@ -839,6 +933,12 @@ class VoiceUIMain(QMainWindow):
         self.worker.set_threshold(val)
         self.thresh_lbl.setText(f"当前阀值: {val} dBFS")
     
+    def _on_model_ready(self):
+        self.statusBar().showMessage("🧠 Whisper 模型就绪 — 点 '开启语音' 开始对话", 5000)
+    
+    def _on_model_failed(self, err):
+        self.statusBar().showMessage(f"⚠ Whisper 加载失败: {err[:80]}")
+    
     def _on_listen_toggle(self, on: bool):
         self.btn_listen.setText("🎙 关闭语音" if on else "🎙 开启语音")
         self.worker.set_listening(on)
@@ -852,18 +952,58 @@ class VoiceUIMain(QMainWindow):
             self._append("系统", "⏹ 语音已关闭", "#6080a0")
     
     def _on_ptt_press(self):
-        if not self.btn_listen.isChecked():
-            self.btn_listen.setChecked(True)
-        # PTT 期间 disable barge-in，专注于单次发言
-        self.worker.set_barge_in(False)
-        self.worker.set_listening(True)
-        # 强制中断当前 TTS（如果 PTT 时 AI 还在说）
+        """按住空格/按住按钮 → 立即进入录音"""
+        if self._ptt_active:
+            return  # 幂等
+        self._ptt_active = True
+        # 中断任何还在说的 TTS
         self._tts.stop()
+        self.worker.set_barge_in(False)
+        # 隐式开麦 + 重置 capture buf
+        self.worker.start_ptt()
+        # GUI 状态
+        self.btn_ptt.setChecked(True)
+        self._set_state("USER_SPEAKING")
+        self._append("系统", "🎯 PTT 录音中…（松开送出）", "#80c0ff")
     
     def _on_ptt_release(self):
-        # 松开结束本次发言，等尾静音，触发 STT → 发送
-        # 不真正关掉监听，让 PTT 后仍可继续捕获尾音
-        pass
+        """松开空格/松开按钮 → 立即送 ASR + 发给海绵宝宝"""
+        if not self._ptt_active:
+            return
+        self._ptt_active = False
+        self.btn_ptt.setChecked(False)
+        sent = self.worker.end_ptt()  # 强制 buf → STT
+        if sent:
+            self._set_state("TRANSCRIBING")
+            self._append("系统", "⏏ 松开 → 送 ASR 中…", "#80c0ff")
+        else:
+            # buf 空：什么都不送
+            self._set_state("IDLE")
+            self._append("系统", "🎯 PTT 未检测到录音", "#6080a0")
+    
+    def _is_text_input_focused(self) -> bool:
+        """Qt输入控件获得焦点时，空格不应被 PTT 抢走"""
+        from PySide6.QtWidgets import QTextEdit, QLineEdit
+        fw = self.focusWidget()
+        return isinstance(fw, (QTextEdit, QLineEdit))
+    
+    def keyPressEvent(self, event):
+        """空格 = 按住说话（但输入控件里不被抢）"""
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            if not self._is_text_input_focused():
+                self._on_ptt_press()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+    
+    def keyReleaseEvent(self, event):
+        """松开空格 = 结束 PTT"""
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            if not self._is_text_input_focused():
+                self._on_ptt_release()
+                event.accept()
+                return
+        super().keyReleaseEvent(event)
     
     def _on_interrupt(self):
         if self._state != "AI_SPEAKING":
@@ -873,10 +1013,8 @@ class VoiceUIMain(QMainWindow):
         self._append("系统", "⏸ 被打断了，听你说…", "#ffa060")
         # 切换到普通捕获模式
         self.worker.set_barge_in(False)
-        # 立即把现在的预缓冲清掉，让新发言被正常捕获
-        # (worker 已经在 barge_in 模式下短暂 active，speech_active 已置位)
-        # 重置内部状态让下一次 is_active 触发新一轮捕获
-        self.worker._speech_active = False
+        # ⚠️ 不要重置 _speech_active / _speech_buf
+        # ——barge 模式已在累积，normal 模式会无缝接管
     
     def _on_user_text(self, text: str):
         self._append("蟹老板", text, "#80ffb0")
