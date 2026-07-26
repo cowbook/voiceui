@@ -6,10 +6,10 @@ diagnose.py — 语音 UI 排错脚本（不启动 GUI）
   1) sounddevice 看得到哪些输入设备
   2) 默认输入设备能不能采到音频 + 实时 dB
   3) silero-vad 在真实音频上的反应
-  4) faster-whisper 能不能顺利转写
+    4) 阿里云通义 ASR 是否可初始化，并尝试转写
 
 跑：  ./diagnose.py        # 3 秒短测
-      ./diagnose.py 8      # 8 秒长测
+    ./diagnose.py 8      # 8 秒长测
 """
 import sys, time, os
 from pathlib import Path
@@ -109,20 +109,22 @@ def main():
     except Exception as e:
         print(f"   ❌ VAD 加载/调用失败: {e}")
     
-    # 4) 听写测试
-    print(f"\n✍️  5) faster-whisper 转写测试（turbo 模型）：")
-    print("   首次会下模型 ~1.5GB，等几分钟…")
-    try:
-        from faster_whisper import WhisperModel
-        m = WhisperModel("turbo", device="cpu", compute_type="int8")
-        segments, info = m.transcribe(audio, language="zh", vad_filter=False)
-        text = "".join(s.text for s in segments).strip()
-        if text:
-            print(f"   ✅ 听写结果: 「{text}」")
-        else:
-            print("   (无识别结果，可能确实太安静 / 没说话)")
-    except Exception as e:
-        print(f"   ❌ 听写失败: {e}")
+    # 4) 云端听写测试（阿里通义）
+    print(f"\n✍️  5) 阿里云通义 ASR 测试：")
+    key = os.environ.get("DASHSCOPE_API_KEY", "")
+    if not key or key == "YOUR_DASHSCOPE_API_KEY":
+        print("   ❌ DASHSCOPE_API_KEY 未设置或仍是占位符")
+    else:
+        try:
+            from cloud_asr import cloud_asr_for
+            asr = cloud_asr_for()
+            text = asr.transcribe(audio, sample_rate=SR).strip()
+            if text:
+                print(f"   ✅ 云端识别结果: 「{text}」")
+            else:
+                print("   ⚠ 云端返回空文本（可能说话太短或环境噪声过大）")
+        except Exception as e:
+            print(f"   ❌ 云端识别失败: {e}")
     
     print("\n" + "=" * 50)
     print("✅ 诊断结束")

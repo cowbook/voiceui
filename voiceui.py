@@ -14,7 +14,7 @@ voiceui.py — 海绵宝宝 · 语音交互客户端
 依赖：
   · PySide6、sounddevice、numpy
   · silero-vad（VAD，轻量 ONNX）
-  · faster-whisper（本地 STT，中文友好）
+    · DashScope + websockets（阿里云通义语音识别）
   · macOS `say` 命令（TTS，可被 SIGTERM 杀掉以实现打断）
   · `openclaw agent --json`（连到海绵宝宝——也就是我 😎）
 
@@ -28,12 +28,13 @@ import json
 import math
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-import wave
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,7 +44,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QObject, QSize
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QLinearGradient, QFont,
-    QRadialGradient, QPixmap, QFontDatabase, QIcon,
+    QRadialGradient, QPixmap, QPainterPath, QFontDatabase, QIcon,
     QShortcut, QKeySequence, QKeyEvent,
 )
 from PySide6.QtWidgets import (
@@ -56,18 +57,27 @@ from PySide6.QtWidgets import (
 import sounddevice as sd
 import silero_vad
 from silero_vad import load_silero_vad, VADIterator
-from faster_whisper import WhisperModel
 
 # --- Constants ---------------------------------------------------------------
 
 APP_DIR  = Path(__file__).resolve().parent
 ASSETS   = APP_DIR / "assets"
-AVATAR   = ASSETS / "avatar.png"
+AVATAR   = ASSETS / "babyicon.png"
+LEFT_BG  = ASSETS / "background-text-show.jpeg"
 LOG_DIR  = APP_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION_KEY = "agent:main:voiceui"   # 持久化语音 session（与 webchat 隔离）
 DEFAULT_MODEL = "minimax/MiniMax-M3" # 默认模型（与 webchat 同源）
+
+# 给 Agent 的语音对话提示：确保输出适合直接 TTS 播放。
+VOICE_REPLY_GUIDE = (
+    "你正在和用户进行语音对话。"
+    "请使用自然、简洁、口语化中文回答，"
+    "输出必须适合直接TTS朗读。"
+    "不要使用特殊符号、表情、Markdown、项目符号或多余格式。"
+    "只输出最终讲稿正文。"
+)
 
 # TTS 默认值
 TTS_BACKEND_DEFAULT = "edge"     # "edge" 在线 / "say" 本地
@@ -82,9 +92,14 @@ CHANNELS       = 1
 
 # VAD
 SILENCE_END_FRAMES  = 20             # ~640ms 静音结尾（中文说话默认是这样）
-MIN_SPEECH_FRAMES   = 4              # ~128ms 最短有效发言
+MIN_SPEECH_FRAMES   = 10             # ~320ms 最短有效发言，减少噪声误触发
 PRE_BUFFER_FRAMES   = 6              # 发言开始前预缓冲 ~200ms，防切音头
 DB_FLOOR, DB_CEIL   = -60.0, 0.0     # dB 显示范围
+
+# Barge-in（打断 AI 回答）
+BARGE_MIN_TTS_SEC = 3.0              # AI 至少讲满 3s 才允许打断
+BARGE_INTERRUPT_EXTRA_DB = 18.0      # 需显著高于门限，防小噪声触发
+BARGE_INTERRUPT_ABS_DB = -22.0       # 绝对音量下限（更接近“大声”）
 
 # TTS
 TTS_VOICE  = "Tingting"
@@ -102,8 +117,6 @@ class AudioWorker(QThread):
     partial_text        = Signal(str)    # 实时字幕（每 2s 更新）
     user_text_ready     = Signal(str)
     interrupt_detected  = Signal()
-    model_ready         = Signal()       # Whisper 加载完
-    model_failed        = Signal(str)    # Whisper 加载失败
     error               = Signal(str)
     
     def __init__(self):
@@ -113,13 +126,6 @@ class AudioWorker(QThread):
         self.threshold_db   = -30.0        # 默认门限；启用监听时会自动校准
         self.listening_on   = False        # 总开关
         self.barge_in       = False        # 是否处于"双工打断"模式（TTS 期间）
-        # Whisper 模型懒加载
-        self._whisper: WhisperModel | None = None
-        self._whisper_lock = threading.Lock()
-        # mlx-whisper (更优 partial 引擎)
-        self._mlx_whisper_lib = None
-        self._mlx_ok = False
-        self._mlx_whisper_done = False
         # 内部缓冲
         self._pre_buf  : list[np.ndarray] = []   # 发言前的预缓冲
         self._speech_buf: list[np.ndarray] = []
@@ -128,23 +134,23 @@ class AudioWorker(QThread):
         self._speech_frames = 0
         self._frame_count = 0
         self._running = True
-        # ASR 后端选择：hybrid / cloud / local
-        self.asr_mode = "hybrid"
-        self.cloud_provider = None
+        # ASR 固定：阿里云通义 Paraformer
         self._cloud = None
         self._cloud_lock = threading.Lock()
         # 云端实时 ASR session
         self._stream_session = None
         self._stream_final_text: str = ""
+        self._stream_partial_text: str = ""
         self._stream_final_lock = threading.Lock()
         # TTS 生命周期：用于防自听
         self._tts_active = False
         self._tts_start_ts = 0.0
         self._tts_end_ts = 0.0
         self._tts_lock = threading.Lock()
-        # 云端实时 ASR session（不占云 REST 限额；首选 hybrid / cloud 模式）
+        # 云端实时 ASR session（不占云 REST 限额）
         self._stream_session = None
         self._stream_final_text: str = ""
+        self._stream_partial_text: str = ""
         self._stream_final_lock = threading.Lock()
         self._silence_count = 0
         self._speech_frames = 0
@@ -153,9 +159,6 @@ class AudioWorker(QThread):
         # PTT（Push-to-Talk）状态
         self._ptt_active = False
         self._ptt_lock = threading.Lock()
-        # Partial STT（实时字幕）状态
-        self._partial_running = False
-        self._partial_lock = threading.Lock()
         # Silero VAD（v6 API）
         try:
             self._vad_model = load_silero_vad()
@@ -206,7 +209,8 @@ class AudioWorker(QThread):
         levels.sort()
         idx = int(len(levels) * 0.95)
         p95 = levels[min(idx, len(levels)-1)]
-        new_threshold = max(min(p95 + 6.0, -10.0), -55.0)
+        # 门限略放宽，避免人声被判成过短片段。
+        new_threshold = max(min(p95 + 3.0, -15.0), -55.0)
         with self._lock:
             self.threshold_db = new_threshold
         return new_threshold, p95
@@ -228,7 +232,6 @@ class AudioWorker(QThread):
                 self._pre_buf.clear()
                 self._silence_count = 0
                 self._speech_frames = 0
-        self.stop_partial_stt()
 
     def tts_ended(self, keep_buf: bool = False):
         """TTS 结束（自然 / 被打断）调用——清 buf + 标记尾回声窗口。
@@ -245,7 +248,6 @@ class AudioWorker(QThread):
             self._pre_buf.clear()
             self._silence_count = 0
             self._speech_frames = 0
-        self.stop_partial_stt()
     
     def is_in_echo_window(self) -> bool:
         """True：TTS 刚开始 600ms 内，或刚结束 600ms 内——这些时段不 capture。"""
@@ -268,7 +270,6 @@ class AudioWorker(QThread):
             self._speech_buf.clear()
             self._silence_count = 0
             self._speech_frames = 0
-        self.start_partial_stt()  # PTT 也上实时字幕
     
     def end_ptt(self) -> bool:
         """松开：立刻把当前 buf 送 STT
@@ -280,7 +281,6 @@ class AudioWorker(QThread):
             if not self._speech_active or not self._speech_buf:
                 self._speech_active = False
                 self._speech_buf.clear()
-                self.stop_partial_stt()
                 # 云端 session 也要结束
                 self._stop_cloud_stream()
                 return False
@@ -289,7 +289,6 @@ class AudioWorker(QThread):
             self._speech_active = False
             self._silence_count = 0
             self._speech_frames = 0
-        self.stop_partial_stt()
         # 云端：先 拿 stream_final_text（调用 stop session 需点击几秒）
         cloud_text = self._stop_cloud_stream()
         if cloud_text:
@@ -402,21 +401,34 @@ class AudioWorker(QThread):
                     self._silence_count = 0
                     self._speech_frames = 0
                     self._speech_buf = list(self._pre_buf)
-                    self.start_partial_stt()
                     self._start_cloud_stream()
+                    for f in self._pre_buf:
+                        self._feed_cloud_stream(f)
                     self.speech_started.emit()
                 self._speech_buf.append(audio.copy())
+                self._feed_cloud_stream(audio)
                 self._speech_frames += 1
                 self._silence_count = 0
             else:
                 # 静音帧：不算发言结束，还是收着
                 if self._speech_active:
                     self._speech_buf.append(audio.copy())
+                    self._feed_cloud_stream(audio)
             return
 
         if barge_in:
             # 双工模式：检测打断 + 累积语音帧，过渡到 normal 模式时不丢首音节
-            if is_active:
+            tts_elapsed = (time.time() - tts_start) if tts_active else 0.0
+            interrupt_threshold = min(
+                max(threshold_db + BARGE_INTERRUPT_EXTRA_DB, BARGE_INTERRUPT_ABS_DB),
+                -8.0,
+            )
+            can_interrupt = (
+                tts_active
+                and tts_elapsed >= BARGE_MIN_TTS_SEC
+                and db > interrupt_threshold
+            )
+            if can_interrupt:
                 if not self._speech_active:
                     # 第一次检测到用户声音 → 转为“捕获+打断”模式
                     self._speech_active = True
@@ -428,6 +440,7 @@ class AudioWorker(QThread):
                 else:
                     # 已触发，继续累积（让 GUI 来得及关 TTS）
                     self._speech_buf.append(audio.copy())
+                    self._feed_cloud_stream(audio)
                     self._speech_frames += 1
                     self._silence_count = 0
             return
@@ -440,10 +453,12 @@ class AudioWorker(QThread):
                 self._silence_count = 0
                 self._speech_frames = 0
                 self._speech_buf = list(self._pre_buf)
-                self.start_partial_stt()
                 self._start_cloud_stream()
+                for f in self._pre_buf:
+                    self._feed_cloud_stream(f)
                 self.speech_started.emit()
             self._speech_buf.append(audio.copy())
+            self._feed_cloud_stream(audio)
             self._speech_frames += 1
             self._silence_count = 0
         else:
@@ -457,89 +472,69 @@ class AudioWorker(QThread):
                     if duration_frames >= MIN_SPEECH_FRAMES:
                         audio_segment = np.concatenate(self._speech_buf)
                         self._speech_buf.clear()
-                        self.stop_partial_stt()
                         self.speech_ended.emit()
-                        # STT 在工作线程跑（避免阻塞 callback）
+                        # 在工作线程结束云端会话 + 转写，避免阻塞 audio callback。
                         threading.Thread(
-                            target=self._transcribe, args=(audio_segment,),
+                            target=self._finalize_segment, args=(audio_segment,),
                             daemon=True,
                         ).start()
                     else:
+                        # 太短片段也要关掉本轮 stream，防止文本跨轮串联。
+                        threading.Thread(target=self._stop_cloud_stream, daemon=True).start()
                         self._speech_buf.clear()
                     self._silence_count = 0
                     self._speech_frames = 0
     
     def _transcribe(self, audio: np.ndarray):
-        """最终转写：根据 self.asr_mode 选 在线 / 本地 / hybrid。
-        注意：如果 _stop_cloud_stream 前面已经在主线程拿到 final text，则 _transcribe 不多走一趟。
-        """
+        """最终转写：固定走阿里云通义 ASR。"""
         # 检查云端 stream final 是否已拿到
         with self._stream_final_lock:
             stream_final = self._stream_final_text
+            stream_partial = self._stream_partial_text
             # 清空，避免影响下一次
             self._stream_final_text = ""
-        if stream_final and self.asr_mode in ("cloud", "hybrid"):
+            self._stream_partial_text = ""
+        if stream_final:
             self.user_text_ready.emit(stream_final)
             return
-        
-        text = ""
-        err = None
-        if self.asr_mode in ("cloud", "hybrid"):
-            try:
-                if self._cloud is None:
-                    with self._cloud_lock:
-                        if self._cloud is None:
-                            from cloud_asr import cloud_asr_for, _detect_provider
-                            provider = self.cloud_provider or _detect_provider()
-                            if not provider:
-                                raise RuntimeError("没云端 key")
-                            self._cloud = cloud_asr_for(provider)
-                text = self._cloud.transcribe(audio, SAMPLE_RATE).strip()
-            except Exception as e:
-                err = f"云 {self.cloud_provider}: {e}"
-        if not text and self.asr_mode in ("local", "hybrid"):
-            try:
-                if self._whisper is None:
-                    with self._whisper_lock:
-                        if self._whisper is None:
-                            self._whisper = WhisperModel(
-                                "turbo", device="cpu", compute_type="int8"
-                            )
-                            self.model_ready.emit()
-                segments, info = self._whisper.transcribe(
-                    audio, language="zh", beam_size=5, vad_filter=False,
-                )
-                text = "".join(seg.text for seg in segments).strip()
-            except Exception as e:
-                err = err or f"本地 Whisper: {e}"
-        if text:
-            self.user_text_ready.emit(text)
-        elif err:
-            self.error.emit(f"STT 失败: {err}")
-    
-    def start_partial_stt(self):
-        """发言期间背景跳 2 秒一次的实时识别。"""
-        with self._partial_lock:
-            if self._partial_running:
-                return
-            self._partial_running = True
-        t = threading.Thread(target=self._partial_stt_loop, daemon=True)
-        t.start()
+        # 流式常见情况：只有 partial 没有 final，直接回退到 partial，避免误报失败
+        if stream_partial:
+            self.user_text_ready.emit(stream_partial)
+            return
 
-    def stop_partial_stt(self):
-        with self._partial_lock:
-            self._partial_running = False
+        try:
+            if self._cloud is None:
+                with self._cloud_lock:
+                    if self._cloud is None:
+                        from cloud_asr import cloud_asr_for
+                        self._cloud = cloud_asr_for()
+            text = self._cloud.transcribe(audio, SAMPLE_RATE).strip()
+            if text:
+                self.user_text_ready.emit(text)
+            else:
+                self.error.emit("STT 失败: 云端未返回文本")
+        except Exception as e:
+            self.error.emit(f"STT 失败: 阿里云识别异常: {e}")
+
+    def _finalize_segment(self, audio: np.ndarray):
+        """结束流式会话并产出本段文本；无结果时走 REST 兜底。"""
+        cloud_text = self._stop_cloud_stream()
+        if cloud_text:
+            self.user_text_ready.emit(cloud_text)
+            return
+        self._transcribe(audio)
 
     def _start_cloud_stream(self):
-        """如果 asr_mode 含 cloud，开一个实时 ASR session（不占云 REST 限额）。"""
-        if self.asr_mode not in ("cloud", "hybrid"):
-            return
+        """开一个阿里云实时 ASR session（用于实时字幕和最终文本）。"""
         if self._stream_session is not None:
             return
         try:
+            with self._stream_final_lock:
+                self._stream_final_text = ""
+                self._stream_partial_text = ""
             from streaming_asr import AliyunStreamingASR
             sess = AliyunStreamingASR(
-                on_partial=lambda t: self.partial_text.emit(t),
+                on_partial=lambda t: self._on_stream_partial(t),
                 on_final=lambda t: self._on_stream_final(t),
                 on_error=lambda e: None,
             )
@@ -547,6 +542,22 @@ class AudioWorker(QThread):
             self._stream_session = sess
         except Exception:
             self._stream_session = None
+
+    def _feed_cloud_stream(self, audio: np.ndarray):
+        """将 float32 音频帧送入阿里云流式 ASR。"""
+        sess = self._stream_session
+        if sess is None:
+            return
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+        try:
+            sess.feed(pcm)
+        except Exception:
+            pass
+
+    def _on_stream_partial(self, text: str):
+        with self._stream_final_lock:
+            self._stream_partial_text = text
+        self.partial_text.emit(text)
 
     def _on_stream_final(self, text: str):
         with self._stream_final_lock:
@@ -565,106 +576,46 @@ class AudioWorker(QThread):
         with self._stream_final_lock:
             if text and not self._stream_final_text:
                 self._stream_final_text = text
-            return self._stream_final_text
+            if self._stream_final_text:
+                return self._stream_final_text
+            return self._stream_partial_text
         return text or ""
-
-    def _partial_stt_loop(self):
-        """后台 partial STT：每 1.2s 对最近 ~1.2s 音频转一次，emit partial_text。
-        选最块的模型：优先 mlx-whisper tiny (Apple Silicon GPU)，以 faster-whisper turbo 作 fallback。
-        """
-        import math
-        PARTIAL_INTERVAL = 1.2  # 1.2s 刷新
-        PARTIAL_WINDOW = 24     # 0.75s @ 16kHz
-        PARTIAL_MIN_BYTES = 8000  # > 0.5s
-        while True:
-            with self._partial_lock:
-                if not self._partial_running:
-                    return
-            time.sleep(PARTIAL_INTERVAL)
-            with self._lock:
-                if not self._speech_active or not self._speech_buf:
-                    continue
-                tail = list(self._speech_buf[-PARTIAL_WINDOW:])
-                head = list(self._pre_buf)
-                buf_copy = (head + tail)[-PARTIAL_WINDOW - len(head):]
-            if not buf_copy or sum(len(c) for c in buf_copy) < PARTIAL_MIN_BYTES:
-                continue
-            audio = np.concatenate(buf_copy).astype(np.float32)
-            rms = float(np.sqrt(np.mean(audio * audio)) + 1e-10)
-            db = 20 * math.log10(rms)
-            with self._lock:
-                thr = self.threshold_db
-            if db < thr - 6:  # 太安静不出 (防 hallucination)
-                continue
-            text = ""
-            try:
-                text = self._mlx_partial(audio) or self._turbo_partial(audio)
-            except Exception as e:
-                self.error.emit(f"partial STT: {e}")
-            text = (text or "").strip()
-            if text and text != getattr(self, "_last_partial_text", ""):
-                self._last_partial_text = text
-                self.partial_text.emit(text)
-
-    def _mlx_partial(self, audio: np.ndarray) -> str:
-        """最优：Apple Silicon 上 mlx-whisper tiny GPU 加速。"""
-        if self._mlx_whisper_done:
-            return self._mlx_whisper_text(audio) if self._mlx_ok else ""
-        try:
-            import mlx_whisper as mw  # type: ignore
-            self._mlx_whisper_lib = mw
-            self._mlx_ok = True
-            self._mlx_whisper_done = True
-        except Exception:
-            self._mlx_ok = False
-            self._mlx_whisper_done = True
-            return ""
-        return self._mlx_whisper_text(audio)
-
-    def _mlx_whisper_text(self, audio: np.ndarray) -> str:
-        try:
-            res = self._mlx_whisper_lib.transcribe(
-                audio, language="zh",
-                path_or_hf_repo="mlx-community/whisper-tiny-mlx",
-            )
-            return (res.get("text") or "").strip()
-        except Exception as e:
-            self.error.emit(f"mlx STT: {e}")
-            return ""
-
-    def _turbo_partial(self, audio: np.ndarray) -> str:
-        """fallback：faster-whisper turbo。看 size 调 beam。"""
-        try:
-            with self._whisper_lock:
-                if self._whisper is None:
-                    self._whisper = WhisperModel(
-                        "turbo", device="cpu", compute_type="int8",
-                    )
-                    self.model_ready.emit()
-            segs, _ = self._whisper.transcribe(
-                audio, language="zh", beam_size=1,
-                vad_filter=False, without_timestamps=True,
-            )
-            return "".join(s.text for s in segs).strip()
-        except Exception as e:
-            self.error.emit(f"turbo STT: {e}")
-            return ""
-
-    def prewarm_whisper(self):
-        """后台预热模型，避免首次 STT 时才加载造成冷启动跳跃"""
-        def _go():
-            try:
-                if self._whisper is None:
-                    self._whisper = WhisperModel(
-                        "turbo", device="cpu", compute_type="int8"
-                    )
-                self.model_ready.emit()
-            except Exception as e:
-                self.model_failed.emit(str(e))
-        threading.Thread(target=_go, daemon=True).start()
 
 
 # --- Custom widgets ----------------------------------------------------------
+
+class ScaledBackgroundFrame(QFrame):
+    """带等比背景图的面板：随尺寸缩放，保持比例并居中裁切。"""
+
+    def __init__(self, image_path: Path, parent=None):
+        super().__init__(parent)
+        self._bg = QPixmap(str(image_path))
+        self.setStyleSheet("background: transparent;")
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # 圆角裁切，保持与面板边框一致。
+        path = QPainterPath()
+        path.addRoundedRect(self.rect().adjusted(0, 0, -1, -1), 10, 10)
+        p.setClipPath(path)
+
+        if not self._bg.isNull():
+            scaled = self._bg.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
+        else:
+            p.fillRect(self.rect(), QColor(18, 28, 44, 220))
+
+        # 轻微暗层保证前景文字对比度。
+        p.fillRect(self.rect(), QColor(8, 12, 24, 72))
+        super().paintEvent(event)
 
 class WaveformWidget(QWidget):
     """50 段渐变 bar 实时声纹"""
@@ -700,7 +651,7 @@ class WaveformWidget(QWidget):
         gap = max(2, (w - 2 * margin - bar_w * n) // (n - 1))
         
         # baseline line
-        p.setPen(QPen(QColor(40, 80, 120, 100), 1))
+        p.setPen(QPen(QColor(220, 236, 255, 130), 1))
         p.drawLine(margin, h // 2, w - margin, h // 2)
         
         for i, lvl in enumerate(self._history):
@@ -710,16 +661,16 @@ class WaveformWidget(QWidget):
             y_top = h // 2 - amp / 2
             y_bot = h // 2 + amp / 2
             
-            # 渐变：cyan → purple → pink
+            # 渐变：浅青 → 奶黄 → 浅珊瑚（与海底背景拉开对比）
             grad = QLinearGradient(0, y_top, 0, y_bot)
-            grad.setColorAt(0.0, QColor(80, 230, 255))    # cyan
-            grad.setColorAt(0.5, QColor(140, 90, 240))    # purple
-            grad.setColorAt(1.0, QColor(255, 100, 200))  # pink
+            grad.setColorAt(0.0, QColor(190, 248, 255))   # light cyan
+            grad.setColorAt(0.5, QColor(255, 245, 190))   # cream yellow
+            grad.setColorAt(1.0, QColor(255, 214, 196))   # soft coral
             
             p.fillRect(int(x), int(y_top), bar_w, int(amp), grad)
             
             # 微光
-            p.setPen(QPen(QColor(180, 240, 255, 60), 1))
+            p.setPen(QPen(QColor(255, 255, 255, 95), 1))
             p.drawRect(int(x) - 1, int(y_top) - 1, bar_w + 2, int(amp) + 2)
 
 
@@ -766,8 +717,7 @@ class AvatarWidget(QWidget):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(c)
             p.drawEllipse(cx - radius, cy - radius, radius * 2, radius * 2)
-        
-        # 头像
+
         if not self._avatar.isNull():
             aw = self._avatar.width()
             ah = self._avatar.height()
@@ -799,6 +749,55 @@ class _TTSBase(QObject):
         super().__init__()
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        self._gen_done = threading.Event()
+        self._gen_done.set()
+
+    def _select_player_command(self, audio_file: str) -> list[str] | None:
+        """按平台选择可用播放器命令（阻塞到播放结束）。"""
+        if sys.platform == "darwin":
+            return ["afplay", audio_file]
+
+        if sys.platform.startswith("linux"):
+            if shutil.which("ffplay"):
+                return ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", audio_file]
+            if shutil.which("mpv"):
+                return ["mpv", "--no-video", "--really-quiet", audio_file]
+            if shutil.which("mpg123"):
+                return ["mpg123", "-q", audio_file]
+            if shutil.which("mpg321"):
+                return ["mpg321", "-q", audio_file]
+            if shutil.which("cvlc"):
+                return ["cvlc", "--play-and-exit", "--quiet", audio_file]
+            return None
+
+        if os.name == "nt":
+            win_path = os.path.abspath(audio_file).replace("'", "''")
+            ps_script = (
+                "Add-Type -AssemblyName presentationCore; "
+                "$player = New-Object System.Windows.Media.MediaPlayer; "
+                f"$player.Open([Uri]'file:///{win_path.replace('\\\\', '/')}'); "
+                "$player.Play(); "
+                "while (-not $player.NaturalDuration.HasTimeSpan) { Start-Sleep -Milliseconds 80 }; "
+                "Start-Sleep -Milliseconds ([int]$player.NaturalDuration.TimeSpan.TotalMilliseconds + 120); "
+                "$player.Stop();"
+            )
+            return ["powershell", "-NoProfile", "-Command", ps_script]
+
+        return None
+
+    def _spawn_audio_player(self, audio_file: str) -> bool:
+        cmd = self._select_player_command(audio_file)
+        if not cmd:
+            return False
+        try:
+            kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.name != "nt":
+                kwargs["start_new_session"] = True
+            self._proc = subprocess.Popen(cmd, **kwargs)
+            return True
+        except Exception:
+            self._proc = None
+            return False
     
     def _kill_locked(self):
         if self._proc and self._proc.poll() is None:
@@ -873,10 +872,8 @@ class EdgeTTSDriver(_TTSBase):
         self.voice = voice
         self.rate = rate      # 如 "+10%"、"-20%"
         self.volume = volume  # 如 "+5%"、"-10%"
-        self._tmpfile = "/tmp/voiceui_edge_tts.mp3"
+        self._tmpfile = str(Path(tempfile.gettempdir()) / "voiceui_edge_tts.mp3")
         self._gen_thread: threading.Thread | None = None
-        self._gen_done = threading.Event()
-        self._gen_done.set()  # 初始：有生成义务吗？没有
     
     def speak(self, text: str):
         with self._lock:
@@ -910,15 +907,14 @@ class EdgeTTSDriver(_TTSBase):
         # 2) 播放
         with self._lock:
             self._gen_done.set()
-            try:
-                self._proc = subprocess.Popen(
-                    ["afplay", self._tmpfile],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True,
+            ok = self._spawn_audio_player(self._tmpfile)
+            if not ok:
+                print(
+                    "[EdgeTTS] 播放失败: 未找到可用音频播放器。"
+                    " macOS 需要 afplay；Linux 建议安装 ffplay/mpv/mpg123；"
+                    "Windows 需要 powershell + .NET 媒体组件。",
+                    file=sys.stderr,
                 )
-            except Exception as e:
-                print(f"[EdgeTTS] afplay 失败: {e}", file=sys.stderr)
-                self._proc = None
 
 
 # 旧名兼容：默认使用 EdgeTTS（云端、中文超自然）
@@ -943,12 +939,17 @@ class AgentBackend(QObject):
     
     def _run(self, text: str):
         try:
+            prompt = (
+                f"{VOICE_REPLY_GUIDE}\n"
+                f"用户说：{text}\n"
+                "请直接给出可朗读回答："
+            )
             r = subprocess.run(
                 [
                     "openclaw", "agent",
                     "--model", self.model,
                     "--session-key", self.session_key,
-                    "--message", text,
+                    "--message", prompt,
                     "--json",
                 ],
                 capture_output=True, text=True, timeout=180,
@@ -1036,7 +1037,7 @@ class VoiceUIMain(QMainWindow):
         center.setSpacing(16)
         
         # ---- left: avatar + waveform ----
-        left = QFrame(); left.setObjectName("panel")
+        left = ScaledBackgroundFrame(LEFT_BG); left.setObjectName("leftPanel")
         ll = QVBoxLayout(left)
         ll.setContentsMargins(20, 14, 20, 14)
         ll.setSpacing(4)
@@ -1044,7 +1045,16 @@ class VoiceUIMain(QMainWindow):
         self.avatar = AvatarWidget(AVATAR)
         ll.addWidget(self.avatar, alignment=Qt.AlignmentFlag.AlignCenter)
         
-        # 实时字幕：有内容时亮 + 描边变色；无内容时灰提示
+        wave_title = QLabel("◉  LIVE  WAVEFORM")
+        wave_title.setStyleSheet("color:#d8eeff; font-size:10px; letter-spacing:3px; padding-left:6px;")
+        ll.addWidget(wave_title)
+        
+        self.wave = WaveformWidget()
+        ll.addWidget(self.wave)
+
+        ll.addStretch(1)
+
+        # 实时字幕放到底部（在声波区域下方）。
         self.live_caption = QLabel("🗣  说话中…实时字幕会在这里跳字")
         self.live_caption.setWordWrap(True)
         self.live_caption.setMinimumHeight(48)
@@ -1069,13 +1079,6 @@ class VoiceUIMain(QMainWindow):
         """)
         self.live_caption.setProperty("live", False)
         ll.addWidget(self.live_caption)
-        
-        wave_title = QLabel("◉  LIVE  WAVEFORM")
-        wave_title.setStyleSheet("color:#5090c0; font-size:10px; letter-spacing:3px; padding-left:6px;")
-        ll.addWidget(wave_title)
-        
-        self.wave = WaveformWidget()
-        ll.addWidget(self.wave)
         
         left.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         center.addWidget(left, 3)
@@ -1184,6 +1187,11 @@ class VoiceUIMain(QMainWindow):
             border: 1px solid #1a2a40;
             border-radius: 10px;
         }
+        QFrame#leftPanel {
+            background: transparent;
+            border: 1px solid #1a2a40;
+            border-radius: 10px;
+        }
         QFrame#meter { background: rgba(15, 22, 36, 200); border: 1px solid #1a2a40; border-radius: 6px; }
         QPushButton {
             background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1a2a40, stop:1 #0e1828);
@@ -1227,7 +1235,7 @@ class VoiceUIMain(QMainWindow):
         self.worker.partial_text.connect(self._on_partial_text)
         self.worker.user_text_ready.connect(self._on_user_text)
         self.worker.interrupt_detected.connect(self._on_interrupt)
-        self.worker.error.connect(lambda e: self._set_state("ERROR") or self.statusBar().showMessage(e))
+        self.worker.error.connect(self._on_worker_error)
         
         # slider / buttons
         self.slider.valueChanged.connect(self._on_slider)
@@ -1263,12 +1271,6 @@ class VoiceUIMain(QMainWindow):
         self.worker.set_threshold(val)
         self.thresh_lbl.setText(f"当前阀值: {val} dBFS")
     
-    def _on_model_ready(self):
-        self.statusBar().showMessage("🧠 Whisper 模型就绪 — 点 '开启语音' 开始对话", 5000)
-    
-    def _on_model_failed(self, err):
-        self.statusBar().showMessage(f"⚠ Whisper 加载失败: {err[:80]}")
-    
     def _on_listen_toggle(self, on: bool):
         self.btn_listen.setText("🎙 关闭语音" if on else "🎙 开启语音")
         self.worker.set_listening(on)
@@ -1277,14 +1279,24 @@ class VoiceUIMain(QMainWindow):
             self._append("系统", "🎙 正在校准环境噪声…", "#80c0ff")
             # 后台自动校准：以环境噪声 p95 + 6dB 作阈值
             def _calib():
-                res = self.worker.calibrate(1.5)
-                if res and res[0] is not None:
-                    thr, p95 = res
-                    self.slider.setValue(int(thr))
-                    self.thresh_lbl.setText(f"🔧 已校准：门槛={thr:+.0f} dB / 环境噪声 {p95:+.0f} dB")
-                    self._append("系统", f"🔧 校准完成：环境 {p95:+.0f} dB，门槛 {thr:+.0f} dB（可手动拉滑杆调）", "#80ffb0")
-                else:
-                    self._append("系统", "⚠ 校准失败，使用默认门槛", "#ff8080")
+                try:
+                    res = self.worker.calibrate(1.5)
+                except Exception:
+                    res = (None, None)
+
+                def _apply():
+                    if not self.btn_listen.isChecked():
+                        return
+                    if res and res[0] is not None:
+                        thr, p95 = res
+                        self.slider.setValue(int(thr))
+                        self.thresh_lbl.setText(f"🔧 已校准：门槛={thr:+.0f} dB / 环境噪声 {p95:+.0f} dB")
+                        self._append("系统", f"🔧 校准完成：环境 {p95:+.0f} dB，门槛 {thr:+.0f} dB（可手动拉滑杆调）", "#80ffb0")
+                    else:
+                        self._append("系统", "⚠ 校准失败，使用当前门槛", "#ff8080")
+
+                QTimer.singleShot(0, _apply)
+
             threading.Thread(target=_calib, daemon=True).start()
         else:
             self._tts.stop()
@@ -1402,6 +1414,20 @@ class VoiceUIMain(QMainWindow):
         self.live_caption.setProperty("live", True)
         self.live_caption.style().unpolish(self.live_caption)
         self.live_caption.style().polish(self.live_caption)
+
+    def _on_worker_error(self, msg: str):
+        # 空识别属于常见场景（说话太短/噪声/云端空返回），不应进入 ERROR 状态。
+        if "云端未返回文本" in msg:
+            self._set_state("IDLE")
+            self.live_caption.setProperty("live", False)
+            self.live_caption.setText("🎤  待命")
+            self.live_caption.style().unpolish(self.live_caption)
+            self.live_caption.style().polish(self.live_caption)
+            self.statusBar().showMessage("未识别到有效语音，请再说一次")
+            self._append("系统", "未识别到有效语音，请说长一点或提高音量", "#ffa060")
+            return
+        self._set_state("ERROR")
+        self.statusBar().showMessage(msg)
     
     def _on_user_text(self, text: str):
         # reset 实况字幕，送 agent
@@ -1482,17 +1508,13 @@ class VoiceUIMain(QMainWindow):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
+    
     ap.add_argument("--tts", choices=["edge", "say"], default="edge",
                     help="TTS 后端：edge=微软神经在线 / say=macOS 本地")
     ap.add_argument("--voice", default="zh-CN-XiaoxiaoNeural",
                     help="edge 模式下选声音 (zh-CN-XiaoxiaoNeural/zh-CN-YunxiNeural/...)")
     ap.add_argument("--model", default=DEFAULT_MODEL,
                     help="对话模型 id")
-    ap.add_argument("--asr", choices=["hybrid", "cloud", "local"], default="hybrid",
-                    help="ASR 模式：hybrid=partial 本地 + final 云端（默认），"
-                         "cloud=全云端，local=全本地 Whisper")
-    ap.add_argument("--cloud-provider", choices=["aliyun", "openai"], default=None,
-                    help="强制云端 provider (默认看环境变量)")
     args = ap.parse_args()
     
     app = QApplication(sys.argv)
@@ -1500,8 +1522,6 @@ def main():
     
     win = VoiceUIMain(tts_backend=args.tts, tts_voice=args.voice)
     win._agent.model = args.model
-    win.worker.asr_mode = args.asr
-    win.worker.cloud_provider = args.cloud_provider
     win.show()
     
     sys.exit(app.exec())

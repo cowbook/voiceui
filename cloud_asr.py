@@ -1,34 +1,9 @@
-"""
-cloud_asr.py — 在线 ASR 驱动
-==============================
-
-为海绵宝宝语音助手提供"比本地 Whisper 更准"的中文识别。
-
-支持两个后端：
-  · aliyun  : 阿里云 Paraformer-v2（中文识别之王）
-              需要 DASHSCOPE_API_KEY（百炼/ModelStudio 同一个 key）
-              申请：https://bailian.console.aliyun.com/
-              通常有免费试用积分
-
-  · openai  : OpenAI Whisper API（兼容 Groq / Azure OpenAI）
-              需要 OPENAI_API_KEY
-              申请：https://platform.openai.com/api-keys
-
-接口：
-  from cloud_asr import cloud_asr_for
-  asr = cloud_asr_for("aliyun")
-  text = asr.transcribe(audio_np_float32_16k, sample_rate=16000)
-
-音频：numpy float32 mono 16kHz。
-"""
+"""Aliyun Tongyi (DashScope) cloud ASR only."""
 from __future__ import annotations
 
 import io
 import os
-import sys
-import time
 import wave
-from pathlib import Path
 
 import numpy as np
 
@@ -115,71 +90,9 @@ class AliyunDashScopeASR(CloudASRBase):
             except Exception: pass
 
 
-# ---------- OpenAI Whisper API（也兼容 Groq） ----------
-
-class OpenAIWhisperASR(CloudASRBase):
-    """OpenAI Whisper API（whisper-1）
-    也可用任何 OpenAI-兼容 endpoint（Groq / Azure / 自建），改 base_url 即可。
-    """
-    name = "openai"
-    
-    def __init__(self, base_url: str | None = None):
-        from openai import OpenAI
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY 未设置。https://platform.openai.com/api-keys")
-        kwargs = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = OpenAI(**kwargs)
-        self.base_url = base_url or "https://api.openai.com/v1"
-    
-    def transcribe(self, audio: np.ndarray, sample_rate: int = 16000) -> str:
-        wav_bytes = audio_to_wav_bytes(audio, sample_rate)
-        from openai import OpenAI as _Cls
-        # OpenAI SDK 直接吃 BytesIO 也可以
-        from io import BytesIO
-        file_tuple = ("audio.wav", BytesIO(wav_bytes), "audio/wav")
-        # 新版 API: client.audio.transcriptions.create(model=..., file=(...))
-        resp = self._client.audio.transcriptions.create(
-            model="whisper-1",
-            file=file_tuple,
-            language="zh",
-            response_format="text",
-        )
-        # text 响应：直接拿 str
-        if isinstance(resp, str):
-            return resp.strip()
-        return getattr(resp, "text", "").strip()
-
-
-# ---------- dispatcher ----------
-
-def _detect_provider() -> str | None:
-    """看环境变量，挑第一个有真 key 的 provider。"""
-    dq = os.environ.get("DASHSCOPE_API_KEY")
-    if dq and dq != "YOUR_DASHSCOPE_API_KEY":
-        return "aliyun"
-    oa = os.environ.get("OPENAI_API_KEY")
-    if oa:
-        return "openai"
-    return None
-
-
-def cloud_asr_for(provider: str | None = None) -> CloudASRBase:
-    """构造 cloud ASR。provider=None 时自动检测。"""
-    if provider is None:
-        provider = _detect_provider()
-        if not provider:
-            raise ValueError(
-                "没找到可用 API key。请设 DASHSCOPE_API_KEY 或 OPENAI_API_KEY 后重试。"
-            )
-    p = provider.lower()
-    if p in ("aliyun", "dashscope"):
-        return AliyunDashScopeASR()
-    if p in ("openai", "groq"):
-        return OpenAIWhisperASR()
-    raise ValueError(f"未知 provider: {provider}")
+def cloud_asr_for() -> CloudASRBase:
+    """Construct Aliyun DashScope ASR only."""
+    return AliyunDashScopeASR()
 
 
 # ---------- 模块自检 ----------
@@ -187,29 +100,17 @@ def cloud_asr_for(provider: str | None = None) -> CloudASRBase:
 if __name__ == "__main__":
     print("=== cloud_asr 自检 ===")
     dq = os.environ.get("DASHSCOPE_API_KEY", "")
-    oa = os.environ.get("OPENAI_API_KEY", "")
     print(f"  DASHSCOPE_API_KEY: {'已设' if dq and dq != 'YOUR_DASHSCOPE_API_KEY' else '未设/占位符'}")
-    print(f"  OPENAI_API_KEY:     {'已设' if oa else '未设'}")
-    
-    p = _detect_provider()
-    print(f"  自动检测到: {p}")
-    
-    if not p:
+    if not dq or dq == "YOUR_DASHSCOPE_API_KEY":
         print()
-        print("⚠ 没可用 key——架构已经就绪，给你两个选项：")
+        print("⚠ 没可用 key，请配置阿里云百炼 DashScope key:")
         print()
-        print("A) 阿里云百炼 Paraformer-v2 (中文识别之王)")
-        print("   1. https://bailian.console.aliyun.com/ → 注册")
-        print("   2. API-KEY 管理 → 创建 → 复制")
-        print("   3. export DASHSCOPE_API_KEY='sk-...'")
-        print()
-        print("B) OpenAI Whisper API (通用)")
-        print("   1. https://platform.openai.com/api-keys")
-        print("   2. 创建 key")
-        print("   3. export OPENAI_API_KEY='sk-...'")
+        print("1. https://bailian.console.aliyun.com/ → 注册")
+        print("2. API-KEY 管理 → 创建 → 复制")
+        print("3. export DASHSCOPE_API_KEY='sk-...'")
     else:
         try:
-            asr = cloud_asr_for(p)
-            print(f"  ✅ {p} 初始化 OK：{type(asr).__name__}")
+            asr = cloud_asr_for()
+            print(f"  ✅ aliyun 初始化 OK：{type(asr).__name__}")
         except Exception as e:
-            print(f"  ❌ {p} 初始化失败：{e}")
+            print(f"  ❌ aliyun 初始化失败：{e}")

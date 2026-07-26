@@ -37,7 +37,7 @@ source "$VENV/bin/activate"
 
 # ---- 依赖自检 / 自装 ----
 need_install=0
-for mod in PySide6 sounddevice numpy silero_vad faster_whisper silero_vad onnxruntime; do
+for mod in PySide6 sounddevice numpy silero_vad onnxruntime dashscope websockets; do
   if ! python3 -c "import ${mod}" >/dev/null 2>&1; then
     echo "❌ 缺: $mod"
     need_install=1
@@ -47,7 +47,7 @@ done
 if [[ $need_install -eq 1 ]]; then
   echo "📦 安装依赖..."
   python3 -m pip install --upgrade pip wheel >/dev/null
-  python3 -m pip install --quiet PySide6 sounddevice numpy silero-vad onnxruntime faster-whisper
+  python3 -m pip install --quiet PySide6 sounddevice numpy silero-vad onnxruntime dashscope websockets
   echo "✅ 依赖装好"
 fi
 
