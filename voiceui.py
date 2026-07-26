@@ -81,9 +81,38 @@ VOICE_REPLY_GUIDE = (
 
 # TTS 默认值
 TTS_BACKEND_DEFAULT = "edge"     # "edge" 在线 / "say" 本地
-EDGE_VOICE_DEFAULT  = "zh-CN-XiaoxiaoNeural"
+EDGE_VOICE_DEFAULT  = "zh-CN-YunxiNeural"
 SAY_VOICE_DEFAULT   = "Tingting"
 SAY_RATE_DEFAULT    = "200"
+
+# 不做角色声线克隆，只提供“风格接近”的可调预设。
+TTS_STYLE_PRESETS: dict[str, dict[str, str]] = {
+    "spongebob-lite": {
+        "voice": "zh-CN-YunxiNeural",
+        "rate": "+5%",
+        "volume": "+10%",
+        "pitch": "+75Hz",
+    },
+    "cartoon-bright": {
+        "voice": "zh-CN-XiaoyiNeural",
+        "rate": "+12%",
+        "volume": "+6%",
+        "pitch": "+5Hz",
+    },
+    "cartoon-energetic": {
+        "voice": "zh-CN-XiaoxiaoNeural",
+        "rate": "+22%",
+        "volume": "+10%",
+        "pitch": "+10Hz",
+    },
+    "calm": {
+        "voice": "zh-CN-YunjianNeural",
+        "rate": "+0%",
+        "volume": "+0%",
+        "pitch": "+0Hz",
+    },
+}
+TTS_STYLE_PRESET_DEFAULT = "spongebob-lite"
 
 # Audio
 SAMPLE_RATE    = 16_000
@@ -867,11 +896,18 @@ class EdgeTTSDriver(_TTSBase):
         "zh-CN-shaanxi-XiaoniNeural",    # 陕西女
     ]
     
-    def __init__(self, voice: str = "zh-CN-XiaoxiaoNeural", rate: str = "+0%", volume: str = "+0%"):
+    def __init__(
+        self,
+        voice: str = "zh-CN-XiaoxiaoNeural",
+        rate: str = "+0%",
+        volume: str = "+0%",
+        pitch: str = "+0Hz",
+    ):
         super().__init__()
         self.voice = voice
         self.rate = rate      # 如 "+10%"、"-20%"
         self.volume = volume  # 如 "+5%"、"-10%"
+        self.pitch = pitch    # 如 "+8Hz"、"-4Hz"
         self._tmpfile = str(Path(tempfile.gettempdir()) / "voiceui_edge_tts.mp3")
         self._gen_thread: threading.Thread | None = None
     
@@ -892,7 +928,11 @@ class EdgeTTSDriver(_TTSBase):
             import edge_tts
             async def gen():
                 communicate = edge_tts.Communicate(
-                    text, voice=self.voice, rate=self.rate, volume=self.volume,
+                    text,
+                    voice=self.voice,
+                    rate=self.rate,
+                    volume=self.volume,
+                    pitch=self.pitch,
                 )
                 with open(self._tmpfile, "wb") as f:
                     async for chunk in communicate.stream():
@@ -971,6 +1011,7 @@ class AgentBackend(QObject):
 # --- Main window -------------------------------------------------------------
 
 class VoiceUIMain(QMainWindow):
+    STARTUP_GREETING = "我是海绵宝宝，你的语音助手"
     
     STATE_COLORS = {
         "IDLE":          QColor(80, 230, 255),    # cyan
@@ -992,7 +1033,14 @@ class VoiceUIMain(QMainWindow):
         "INIT":          "🔥 预热模型…",
     }
     
-    def __init__(self, tts_backend: str = "edge", tts_voice: str = "zh-CN-XiaoxiaoNeural"):
+    def __init__(
+        self,
+        tts_backend: str = "edge",
+        tts_voice: str = "zh-CN-XiaoxiaoNeural",
+        tts_rate: str = "+0%",
+        tts_volume: str = "+0%",
+        tts_pitch: str = "+0Hz",
+    ):
         super().__init__()
         self.setWindowTitle("🧽 海绵宝宝 · Voice Agent")
         self.setMinimumSize(1024, 720)
@@ -1004,13 +1052,20 @@ class VoiceUIMain(QMainWindow):
         if tts_backend == "say":
             self._tts = SayTTSDriver()
         else:
-            self._tts = EdgeTTSDriver(voice=tts_voice)
+            self._tts = EdgeTTSDriver(
+                voice=tts_voice,
+                rate=tts_rate,
+                volume=tts_volume,
+                pitch=tts_pitch,
+            )
         self._agent = AgentBackend()
         
         self._build_ui()
         self._wire()
         self._install_space_ptt()
         self._set_state("IDLE")
+        # 窗口启动后自动播报开场白。
+        QTimer.singleShot(300, self._speak_startup_greeting)
     
     # ---- ui ----
     def _build_ui(self):
@@ -1441,16 +1496,23 @@ class VoiceUIMain(QMainWindow):
     
     def _on_agent_reply(self, reply: str):
         self._append("海绵宝宝", reply, "#ff90d0")
+        self._start_tts_playback(reply)
+
+    def _start_tts_playback(self, text: str):
         # 进入 AI_SPEAKING：开启 barge_in + 通知 worker 防自听
         self.worker.set_barge_in(True)
         self.worker.tts_started()
         self._set_state("AI_SPEAKING")
-        self._tts.speak(reply)
+        self._tts.speak(text)
         # 监听 TTS 是否自然结束（轮询计时器）
         self._tts_watchdog = QTimer(self)
         self._tts_watchdog.setSingleShot(False)
         self._tts_watchdog.timeout.connect(self._check_tts_done)
         self._tts_watchdog.start(150)
+
+    def _speak_startup_greeting(self):
+        self._append("海绵宝宝", self.STARTUP_GREETING, "#ff90d0")
+        self._start_tts_playback(self.STARTUP_GREETING)
 
     def _check_tts_done(self):
         if self._tts.is_speaking():
@@ -1511,16 +1573,37 @@ def main():
     
     ap.add_argument("--tts", choices=["edge", "say"], default="edge",
                     help="TTS 后端：edge=微软神经在线 / say=macOS 本地")
-    ap.add_argument("--voice", default="zh-CN-XiaoxiaoNeural",
+    ap.add_argument("--voice", default=None,
                     help="edge 模式下选声音 (zh-CN-XiaoxiaoNeural/zh-CN-YunxiNeural/...)")
+    ap.add_argument("--tts-preset", default=TTS_STYLE_PRESET_DEFAULT,
+                    choices=sorted(TTS_STYLE_PRESETS.keys()),
+                    help="TTS 风格预设（不做角色克隆，仅风格接近）")
+    ap.add_argument("--tts-rate", default=None,
+                    help="覆盖语速，如 +15%% / -10%%")
+    ap.add_argument("--tts-volume", default=None,
+                    help="覆盖音量，如 +8%% / -5%%")
+    ap.add_argument("--tts-pitch", default=None,
+                    help="覆盖音高，如 +8Hz / -4Hz")
     ap.add_argument("--model", default=DEFAULT_MODEL,
                     help="对话模型 id")
     args = ap.parse_args()
+
+    preset = TTS_STYLE_PRESETS.get(args.tts_preset, TTS_STYLE_PRESETS[TTS_STYLE_PRESET_DEFAULT])
+    tts_voice = args.voice if args.voice is not None else preset["voice"]
+    tts_rate = args.tts_rate if args.tts_rate is not None else preset["rate"]
+    tts_volume = args.tts_volume if args.tts_volume is not None else preset["volume"]
+    tts_pitch = args.tts_pitch if args.tts_pitch is not None else preset["pitch"]
     
     app = QApplication(sys.argv)
     app.setApplicationName("海绵宝宝 Voice UI")
     
-    win = VoiceUIMain(tts_backend=args.tts, tts_voice=args.voice)
+    win = VoiceUIMain(
+        tts_backend=args.tts,
+        tts_voice=tts_voice,
+        tts_rate=tts_rate,
+        tts_volume=tts_volume,
+        tts_pitch=tts_pitch,
+    )
     win._agent.model = args.model
     win.show()
     

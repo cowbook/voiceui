@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VOICEUI_DIR="$(cd "$SKILL_DIR/.." && pwd)"
+INSTALLER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VOICEUI_DIR="$(cd "$INSTALLER_DIR/.." && pwd)"
 VENV_DIR="$VOICEUI_DIR/.venv"
 
-print_ok() { printf "[voiceui-skill] %s\n" "$1"; }
-print_warn() { printf "[voiceui-skill][warn] %s\n" "$1"; }
-print_err() { printf "[voiceui-skill][error] %s\n" "$1" >&2; }
+print_ok() { printf "[voiceui-installer] %s\n" "$1"; }
+print_warn() { printf "[voiceui-installer][warn] %s\n" "$1"; }
+print_err() { printf "[voiceui-installer][error] %s\n" "$1" >&2; }
 
 if ! command -v python3 >/dev/null 2>&1; then
   print_err "python3 not found. Please install Python 3.11+ first."
+  exit 1
+fi
+
+if ! command -v openclaw >/dev/null 2>&1; then
+  print_err "openclaw command not found in PATH. Please install OpenClaw first."
   exit 1
 fi
 
@@ -20,6 +25,7 @@ print(f"{sys.version_info.major}.{sys.version_info.minor}")
 PY
 )"
 print_ok "Detected Python $PY_VER"
+print_ok "Detected OpenClaw CLI: $(command -v openclaw)"
 
 if [[ ! -d "$VENV_DIR" ]]; then
   print_ok "Creating virtual environment at $VENV_DIR"
@@ -62,4 +68,4 @@ case "$OS_NAME" in
     ;;
 esac
 
-print_ok "Install completed. Start with: $SKILL_DIR/run.sh"
+print_ok "Install completed. Start with: $INSTALLER_DIR/run.sh"

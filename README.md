@@ -17,9 +17,20 @@
 - 空格按住说话（PTT）
 - 对话回显与状态可视化
 
-## 安装（OpenClaw Skill）
+## 安装（独立程序）
 
-本项目已转成 OpenClaw Skill，适用于任意本地目录，不要求存在 `apps/voiceui` 结构。
+本项目是独立桌面程序，通过 OpenClaw CLI 完成对话能力接入。
+适用于任意本地目录，不要求存在 `apps/voiceui` 结构。
+
+一键安装并启动命令（可直接复制）：
+
+```bash
+git clone https://github.com/cowbook/voiceui.git && cd voiceui/installer && ./one-click.sh
+```
+
+适用条件：已安装并可执行 `openclaw`（在 PATH 中）、`python3`、`bash`。
+
+说明：`one-click.sh` 会自动创建 `.venv`、安装依赖并启动程序。
 
 0. 先获取项目代码（示例）：
 
@@ -31,16 +42,16 @@ cd voiceui
 一键安装并启动（推荐）：
 
 ```bash
-cd voiceui/voiceui-skill
+cd voiceui/installer
 ./one-click.sh
 ```
 
 如果未设置 `DASHSCOPE_API_KEY`，脚本会提示你输入并仅在当前终端会话生效。
 
-1. 进入 skill 目录：
+1. 进入安装器目录：
 
 ```bash
-cd voiceui-skill
+cd installer
 ```
 
 2. 设置阿里云 API Key（必需）：
@@ -55,13 +66,30 @@ export DASHSCOPE_API_KEY='sk-...'
 ./install.sh
 ```
 
-安装脚本会自动：创建 `.venv`、安装依赖、检查 TTS 播放器可用性。
+安装脚本会自动：检查 `openclaw`、创建 `.venv`、安装依赖、检查 TTS 播放器可用性。
 
 ## 启动
 
 ```bash
-cd voiceui-skill
+cd installer
 ./run.sh
+```
+
+可选：使用“风格接近”TTS 预设（非角色克隆）
+
+```bash
+cd voiceui
+.venv/bin/python voiceui.py --tts edge --tts-preset spongebob-lite
+```
+
+可选预设：`spongebob-lite`、`cartoon-bright`、`cartoon-energetic`、`calm`
+
+默认即 `spongebob-lite`（儿童男声卡通感，接近海绵宝宝风格，参数约为 `+20% / +20Hz`）。
+
+也可覆盖细调参数：
+
+```bash
+.venv/bin/python voiceui.py --tts-preset cartoon-energetic --tts-rate +18% --tts-pitch +9Hz
 ```
 
 ## 环境变量
