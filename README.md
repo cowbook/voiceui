@@ -1,6 +1,6 @@
-# 海绵宝宝 Voice UI
+# OpenClaw Voice UI - 海绵宝宝
 
-全双工语音客户端，直接连接 OpenClaw agent。
+把OpenClaw变成能听能说的AI Agent，全双工语音客户端，直接连接 OpenClaw agent。
 当前版本的 ASR 固定为阿里云通义（DashScope Paraformer）。
 
 平台说明：
@@ -17,91 +17,73 @@
 - 空格按住说话（PTT）
 - 对话回显与状态可视化
 
-## 安装（独立程序）
+## 30s 上手
 
-本项目是独立桌面程序，通过 OpenClaw CLI 完成对话能力接入。
-适用于任意本地目录，不要求存在 `apps/voiceui` 结构。
+前置条件：已安装并可执行 `openclaw`（在 PATH 中）、`python3`、`bash`。
 
-一键安装并启动命令（可直接复制）：
+1. 一键安装并启动：
 
 ```bash
 git clone https://github.com/cowbook/voiceui.git && cd voiceui/installer && ./one-click.sh
 ```
 
-适用条件：已安装并可执行 `openclaw`（在 PATH 中）、`python3`、`bash`。
-
-说明：`one-click.sh` 会自动创建 `.venv`、安装依赖并启动程序。
-
-0. 先获取项目代码（示例）：
+2. 以后再次启动：
 
 ```bash
-git clone <你的仓库地址> voiceui
-cd voiceui
+cd voiceui/installer && ./run.sh
 ```
 
-一键安装并启动（推荐）：
+3. 可选：卡通童声参数启动：
 
 ```bash
-cd voiceui/installer
-./one-click.sh
+cd voiceui && .venv/bin/python voiceui.py --tts-preset spongebob-lite
 ```
 
-如果未设置 `DASHSCOPE_API_KEY`，脚本会提示你输入并仅在当前终端会话生效。
+## 安装（独立程序）
 
-1. 进入安装器目录：
+本项目是独立桌面程序，通过 OpenClaw CLI 完成对话能力接入。
+
+说明：
+- `one-click.sh` 会自动创建 `.venv`、安装依赖并启动程序。
+- 如果未设置 `DASHSCOPE_API_KEY`，脚本会提示输入（仅当前终端会话生效）。
+- 阿里云百炼 API Key 申请地址：https://bailian.console.aliyun.com/
+
+可选：手动安装（不立即启动）
 
 ```bash
+git clone https://github.com/cowbook/voiceui.git && cd voiceui
 cd installer
-```
-
-2. 设置阿里云 API Key（必需）：
-
-```bash
 export DASHSCOPE_API_KEY='sk-...'
-```
-
-3. 执行安装脚本：
-
-```bash
 ./install.sh
 ```
 
 安装脚本会自动：检查 `openclaw`、创建 `.venv`、安装依赖、检查 TTS 播放器可用性。
 
-## 启动
+## Quick Start
+
+默认启动（使用默认预设 `spongebob-lite`）：
 
 ```bash
 cd installer
 ./run.sh
 ```
 
-可选：使用“风格接近”TTS 预设（非角色克隆）
+可选：指定更偏卡通的预设启动：
 
 ```bash
 cd voiceui
 .venv/bin/python voiceui.py --tts edge --tts-preset spongebob-lite
 ```
 
-可选预设：`spongebob-lite`、`cartoon-bright`、`cartoon-energetic`、`calm`
+可选预设：`spongebob-lite`（默认）、`cartoon-bright`、`cartoon-energetic`、`calm`
 
 默认即 `spongebob-lite`（儿童男声卡通感，接近海绵宝宝风格，参数约为 `+20% / +20Hz`）。
 
-也可覆盖细调参数：
+可选：覆盖细调参数：
 
 ```bash
 .venv/bin/python voiceui.py --tts-preset cartoon-energetic --tts-rate +18% --tts-pitch +9Hz
 ```
-
-## 环境变量
-
-必须设置阿里云百炼 API Key：
-
-```bash
-export DASHSCOPE_API_KEY='sk-...'
-```
-
-申请地址：
-https://bailian.console.aliyun.com/
 
 ## 使用
 
