@@ -1,5 +1,7 @@
 # OpenClaw Voice UI - 海绵宝宝
 
+![SpongeBob](https://github.com/cowbook/voiceui/blob/main/assets/background-text-show.jpeg?raw=true)
+
 把OpenClaw变成能听能说的AI Agent，全双工语音客户端，直接连接 OpenClaw agent。
 当前版本的 ASR 固定为阿里云通义（DashScope Paraformer）。
 
@@ -24,19 +26,25 @@
 1. 一键安装并启动：
 
 ```bash
-git clone https://github.com/cowbook/voiceui.git && cd voiceui/installer && ./one-click.sh
+curl -fsSL https://raw.githubusercontent.com/cowbook/voiceui/main/installer/bootstrap.sh | bash
+```
+
+PowerShell 一键安装并启动：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/cowbook/voiceui/main/installer/bootstrap.ps1 | iex"
 ```
 
 2. 以后再次启动：
 
 ```bash
-cd voiceui/installer && ./run.sh
+cd ~/.openclaw/apps/voiceui/installer && ./run.sh
 ```
 
 3. 可选：卡通童声参数启动：
 
 ```bash
-cd voiceui && .venv/bin/python voiceui.py --tts-preset spongebob-lite
+cd ~/.openclaw/apps/voiceui && .venv/bin/python voiceui.py --tts-preset spongebob-lite
 ```
 
 ## 安装（独立程序）
