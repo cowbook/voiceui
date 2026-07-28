@@ -23,6 +23,13 @@
 
 前置条件：已安装并可执行 `openclaw`（在 PATH 中）、`python3`、`bash`。
 
+Linux和WSL请先安装portaudio
+
+```bash
+sudo apt update
+sudo apt install -y libportaudio2 portaudio19-dev libasound2-dev
+```
+
 1. 一键安装并启动：
 
 ```bash
