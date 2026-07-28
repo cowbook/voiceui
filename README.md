@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/cowbook/voiceui/main/installer/boot
 PowerShell 一键安装并启动：
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/cowbook/voiceui/main/installer/bootstrap.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; irm 'https://raw.githubusercontent.com/cowbook/voiceui/main/installer/bootstrap.ps1' | iex"
 ```
 
 2. 以后再次启动：
