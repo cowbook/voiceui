@@ -221,8 +221,40 @@ class AudioWorker(QThread):
         sr = SAMPLE_RATE
         block = FRAME_SAMPLES
         levels = []
+        default_input = None
+        selected_device = None
         try:
-            stream = sd.InputStream(samplerate=sr, channels=1, dtype='float32', blocksize=block)
+            default_pair = sd.default.device
+            if isinstance(default_pair, (list, tuple)) and len(default_pair) > 0:
+                default_input = default_pair[0]
+        except Exception:
+            pass
+        try:
+            if default_input is not None and int(default_input) >= 0:
+                info = sd.query_devices(int(default_input))
+                if int(info.get("max_input_channels", 0)) > 0:
+                    selected_device = int(default_input)
+        except Exception:
+            selected_device = None
+        if selected_device is None:
+            try:
+                for idx, dev in enumerate(sd.query_devices()):
+                    if int(dev.get("max_input_channels", 0)) > 0:
+                        selected_device = idx
+                        break
+            except Exception:
+                selected_device = None
+        if selected_device is None:
+            print(f"[calibrate] 无可用输入设备 (default_input={default_input})", file=sys.stderr)
+            return None, None
+        try:
+            stream = sd.InputStream(
+                samplerate=sr,
+                channels=1,
+                dtype='float32',
+                blocksize=block,
+                device=selected_device,
+            )
             with stream:
                 needed = int(duration_s * sr / block)
                 for _ in range(needed):
@@ -231,7 +263,10 @@ class AudioWorker(QThread):
                     db = 20 * math.log10(rms)
                     levels.append(db)
         except Exception as e:
-            print(f"[calibrate] 采样失败: {e}", file=sys.stderr)
+            print(
+                f"[calibrate] 采样失败: {e} (default_input={default_input}, selected_input={selected_device})",
+                file=sys.stderr,
+            )
             return None, None
         if not levels:
             return None, None
