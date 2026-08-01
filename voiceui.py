@@ -164,8 +164,6 @@ class AudioWorker(QThread):
         self._frame_count = 0
         self._running = True
         # ASR 固定：阿里云通义 Paraformer
-        self._cloud = None
-        self._cloud_lock = threading.Lock()
         # 云端实时 ASR session
         self._stream_session = None
         self._stream_final_text: str = ""
@@ -313,7 +311,6 @@ class AudioWorker(QThread):
                 # 云端 session 也要结束
                 self._stop_cloud_stream()
                 return False
-            audio = np.concatenate(self._speech_buf)
             self._speech_buf.clear()
             self._speech_active = False
             self._silence_count = 0
@@ -325,7 +322,6 @@ class AudioWorker(QThread):
             self.speech_ended.emit()
             return True
         self.speech_ended.emit()
-        threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
         return True
     
     def stop(self):
@@ -499,12 +495,11 @@ class AudioWorker(QThread):
                     self._speech_active = False
                     duration_frames = len(self._speech_buf)
                     if duration_frames >= MIN_SPEECH_FRAMES:
-                        audio_segment = np.concatenate(self._speech_buf)
                         self._speech_buf.clear()
                         self.speech_ended.emit()
                         # 在工作线程结束云端会话 + 转写，避免阻塞 audio callback。
                         threading.Thread(
-                            target=self._finalize_segment, args=(audio_segment,),
+                            target=self._finalize_segment,
                             daemon=True,
                         ).start()
                     else:
@@ -514,44 +509,13 @@ class AudioWorker(QThread):
                     self._silence_count = 0
                     self._speech_frames = 0
     
-    def _transcribe(self, audio: np.ndarray):
-        """最终转写：固定走阿里云通义 ASR。"""
-        # 检查云端 stream final 是否已拿到
-        with self._stream_final_lock:
-            stream_final = self._stream_final_text
-            stream_partial = self._stream_partial_text
-            # 清空，避免影响下一次
-            self._stream_final_text = ""
-            self._stream_partial_text = ""
-        if stream_final:
-            self.user_text_ready.emit(stream_final)
-            return
-        # 流式常见情况：只有 partial 没有 final，直接回退到 partial，避免误报失败
-        if stream_partial:
-            self.user_text_ready.emit(stream_partial)
-            return
-
-        try:
-            if self._cloud is None:
-                with self._cloud_lock:
-                    if self._cloud is None:
-                        from cloud_asr import cloud_asr_for
-                        self._cloud = cloud_asr_for()
-            text = self._cloud.transcribe(audio, SAMPLE_RATE).strip()
-            if text:
-                self.user_text_ready.emit(text)
-            else:
-                self.error.emit("STT 失败: 云端未返回文本")
-        except Exception as e:
-            self.error.emit(f"STT 失败: 阿里云识别异常: {e}")
-
-    def _finalize_segment(self, audio: np.ndarray):
-        """结束流式会话并产出本段文本；无结果时走 REST 兜底。"""
+    def _finalize_segment(self):
+        """结束流式会话并产出本段文本。"""
         cloud_text = self._stop_cloud_stream()
         if cloud_text:
             self.user_text_ready.emit(cloud_text)
             return
-        self._transcribe(audio)
+        self.error.emit("STT 失败: 流式识别未返回文本")
 
     def _start_cloud_stream(self):
         """开一个阿里云实时 ASR session（用于实时字幕和最终文本）。"""
@@ -675,9 +639,10 @@ class WaveformWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
         margin = 40
-        bar_w = 5
         n = self._bar_count
-        gap = max(2, (w - 2 * margin - bar_w * n) // (n - 1))
+        gap = 4  # 固定间距：窗口变化时只调整 bar 宽度
+        usable = max(1, w - 2 * margin - gap * (n - 1))
+        bar_w = max(1, usable // n)
         
         # baseline line
         p.setPen(QPen(QColor(220, 236, 255, 130), 1))

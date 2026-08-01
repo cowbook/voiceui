@@ -44,4 +44,5 @@ mv "$SRC_DIR" "$TARGET_DIR"
 
 echo "[voiceui-bootstrap] Installed to $TARGET_DIR"
 cd "$TARGET_DIR/installer"
-exec ./one-click.sh "$@"
+./install.sh
+exec ./run.sh "$@"

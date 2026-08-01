@@ -12,10 +12,11 @@ Independent installer/launcher scripts for the SpongeBob Voice UI app.
 
 ```bash
 cd installer
-./one-click.sh
+./install.sh
+./run.sh
 ```
 
-If `DASHSCOPE_API_KEY` is not exported, the script will prompt for it.
+If `DASHSCOPE_API_KEY` is not exported, set it first before install/start.
 
 ## Manual install
 

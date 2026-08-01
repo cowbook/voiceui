@@ -19,7 +19,7 @@
 - 空格按住说话（PTT）
 - 对话回显与状态可视化
 
-## 30s 上手
+## 安装与启动
 
 前置条件：已安装并可执行 `openclaw`（在 PATH 中）、`python3`、`bash`。
 
@@ -35,28 +35,21 @@ PowerShell 一键安装并启动：
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/cowbook/voiceui/main/installer/bootstrap.ps1 | iex"
 ```
 
-2. 以后再次启动：
+## 启动软件
 
 ```bash
 cd ~/.openclaw/apps/voiceui/installer && ./run.sh
 ```
 
-3. 可选：卡通童声参数启动：
 
-```bash
-cd ~/.openclaw/apps/voiceui && .venv/bin/python voiceui.py --tts-preset spongebob-lite
-```
-
-## 安装（独立程序）
+## 源代码安装
 
 本项目是独立桌面程序，通过 OpenClaw CLI 完成对话能力接入。
 
 说明：
-- `one-click.sh` 会自动创建 `.venv`、安装依赖并启动程序。
 - 如果未设置 `DASHSCOPE_API_KEY`，脚本会提示输入（仅当前终端会话生效）。
 - 阿里云百炼 API Key 申请地址：https://bailian.console.aliyun.com/
 
-可选：手动安装（不立即启动）
 
 ```bash
 git clone https://github.com/cowbook/voiceui.git && cd voiceui
@@ -67,31 +60,16 @@ export DASHSCOPE_API_KEY='sk-...'
 
 安装脚本会自动：检查 `openclaw`、创建 `.venv`、安装依赖、检查 TTS 播放器可用性。
 
-## Quick Start
-
-默认启动（使用默认预设 `spongebob-lite`）：
-
-```bash
-cd installer
-./run.sh
-```
-
-可选：指定更偏卡通的预设启动：
-
-```bash
-cd voiceui
-.venv/bin/python voiceui.py --tts edge --tts-preset spongebob-lite
-```
+## TTS音色
 
 可选预设：`spongebob-lite`（默认）、`cartoon-bright`、`cartoon-energetic`、`calm`
 
-默认即 `spongebob-lite`（儿童男声卡通感，接近海绵宝宝风格，参数约为 `+20% / +20Hz`）。
-
-可选：覆盖细调参数：
+直接覆盖参数tts-rate、tts-pitch，以更改音色：
 
 ```bash
 .venv/bin/python voiceui.py --tts-preset cartoon-energetic --tts-rate +18% --tts-pitch +9Hz
 ```
+
 
 ## 使用
 
@@ -105,14 +83,12 @@ cd voiceui
 1. 录音：sounddevice 采集 16k 单声道
 2. 分段：VAD + dB 阈值决定语音起止
 3. 识别：阿里云流式 ASR 输出 partial/final
-4. 兜底：无流式 final 时走阿里云 REST 转写
-5. 回复：openclaw agent 生成文本，TTS 播放
+4. 回复：openclaw agent 生成文本，TTS 播放
 
 ## 项目文件
 
 - voiceui.py：主界面与音频状态机
 - streaming_asr.py：阿里云实时 ASR WebSocket 客户端
-- cloud_asr.py：阿里云 REST 转写
 - run.sh：依赖检查与启动脚本
 - diagnose.py：麦克风/VAD/云端 ASR 诊断脚本
 
