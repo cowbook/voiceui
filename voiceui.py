@@ -133,6 +133,17 @@ BARGE_INTERRUPT_ABS_DB = -22.0       # 绝对音量下限（更接近“大声�
 # TTS
 TTS_VOICE  = "Tingting"
 TTS_RATE   = "200"
+PTT_KEY = Qt.Key.Key_Space
+PTT_KEY_LABEL = "空格"
+
+
+def _default_ui_font_stack() -> str:
+    """按平台返回常见系统 UI 字体栈，降低缺字和乱码概率。"""
+    if sys.platform == "darwin":
+        return "'PingFang SC','Hiragino Sans GB','Helvetica Neue','Arial'"
+    if os.name == "nt":
+        return "'Microsoft YaHei UI','Segoe UI','Microsoft YaHei','SimSun'"
+    return "'Noto Sans CJK SC','Noto Sans','WenQuanYi Micro Hei','DejaVu Sans','sans-serif'"
 
 
 # --- Audio worker (QThread) --------------------------------------------------
@@ -610,6 +621,8 @@ class ScaledBackgroundFrame(QFrame):
         p.fillRect(self.rect(), QColor(8, 12, 24, 72))
         super().paintEvent(event)
 
+
+
 class WaveformWidget(QWidget):
     """50 段渐变 bar 实时声纹"""
     
@@ -619,6 +632,7 @@ class WaveformWidget(QWidget):
         self._history = [0.0] * 50
         self._bar_count = 50
         self.setMinimumHeight(140)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setStyleSheet("background: transparent;")
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -666,6 +680,99 @@ class WaveformWidget(QWidget):
             # 微光
             p.setPen(QPen(QColor(255, 255, 255, 95), 1))
             p.drawRect(int(x) - 1, int(y_top) - 1, bar_w + 2, int(amp) + 2)
+
+
+class ScaledBackgroundWidget(QWidget):
+    """应用级背景：整图按比例放大/缩小，居中裁切，不重复平铺。"""
+
+    def __init__(self, image_path: Path, parent=None):
+        super().__init__(parent)
+        self._bg = QPixmap(str(image_path))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if not self._bg.isNull():
+            scaled = self._bg.scaled(
+                self.size(),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
+            p.drawPixmap(x, y, scaled)
+        else:
+            p.fillRect(self.rect(), QColor(7, 9, 26))
+        super().paintEvent(event)
+
+
+class RecordingBadgeOverlay(QWidget):
+    """录音态悬浮层：白色半透明矢量麦克风图标（出现/消失闪烁）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setStyleSheet("background: transparent;")
+        self._blink_on = True
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._tick)
+        self._blink_timer.start(360)
+
+    def _tick(self):
+        self._blink_on = not self._blink_on
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+
+        # 整体按最短边缩放：窗口越大图标越大。
+        size = min(w, h) * 0.94
+        cx, cy = w / 2.0, h / 2.0
+        stroke = max(5.0, size * 0.08)  # 线宽随图标缩放，最小 5px
+
+        # 闪烁方式：整图标直接出现/消失，不做呼吸渐变。
+        icon_alpha = 204 if self._blink_on else 0
+        body_w = size * 0.28
+        body_h = size * 0.44
+        body_x = cx - body_w / 2.0
+        body_y = cy - body_h * 0.58
+
+        arc_w = size * 0.62
+        arc_h = size * 0.50
+        arc_x = cx - arc_w / 2.0
+        arc_y = body_y + body_h * 0.35
+
+        stem_top = body_y + body_h
+        stem_bottom = stem_top + size * 0.22
+
+        base_w = size * 0.40
+
+        def _draw_mic_with_pen(pen: QPen):
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(body_x, body_y, body_w, body_h, body_w * 0.46, body_w * 0.46)
+            p.drawArc(int(arc_x), int(arc_y), int(arc_w), int(arc_h), 200 * 16, 140 * 16)
+            p.drawLine(int(cx), int(stem_top), int(cx), int(stem_bottom))
+            p.drawLine(int(cx - base_w / 2.0), int(stem_bottom), int(cx + base_w / 2.0), int(stem_bottom))
+
+        # 外层白色描边（70% 透明，且更宽）
+        outline_alpha = 179 if self._blink_on else 0
+        outline_pen = QPen(QColor(255, 255, 255, outline_alpha), stroke + 16.0)
+        outline_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        outline_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        _draw_mic_with_pen(outline_pen)
+
+        # 内层红色主线
+        main_pen = QPen(QColor(220, 48, 48, icon_alpha), stroke)
+        main_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        main_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        _draw_mic_with_pen(main_pen)
 
 
 class AvatarWidget(QWidget):
@@ -988,7 +1095,8 @@ class VoiceUIMain(QMainWindow):
         "ERROR":         QColor(255, 80, 80),     # 红
     }
     STATE_LABELS = {
-        "IDLE":          "🎤  待命（点击右下方开启）",
+        "IDLE":          "🎤  待命（单击空格激活）",
+        "RECORDING":     "🔴 录音中（按空格停止）",
         "USER_SPEAKING": "🗣️  蟹老板在说话…",
         "TRANSCRIBING":  "🧠  听写中…",
         "THINKING":      "🦐  海绵宝宝在想…",
@@ -1010,9 +1118,13 @@ class VoiceUIMain(QMainWindow):
         self.setWindowTitle("🧽 海绵宝宝 · Voice Agent")
         self.setMinimumSize(1024, 720)
         self.resize(1180, 780)
+        self._ui_font_stack = _default_ui_font_stack()
+        self._app_bg_path = str(LEFT_BG).replace("\\", "/")
         
         self._state = "IDLE"
         self._ptt_active = False
+        self._space_pressed = False
+        self._listening_on = False
         # TTS backend: "edge"（在线神经语音，默认）还是 "say"（本地）
         if tts_backend == "say":
             self._tts = SayTTSDriver()
@@ -1026,15 +1138,16 @@ class VoiceUIMain(QMainWindow):
         self._agent = AgentBackend()
         
         self._build_ui()
+        self._update_wave_height()
         self._wire()
-        self._install_space_ptt()
+        self._install_ptt_hotkey()
         self._set_state("IDLE")
         # 窗口启动后自动播报开场白。
         QTimer.singleShot(300, self._speak_startup_greeting)
     
     # ---- ui ----
     def _build_ui(self):
-        central = QWidget(self)
+        central = ScaledBackgroundWidget(LEFT_BG, self)
         central.setObjectName("central")
         self.setCentralWidget(central)
         central.setStyleSheet(self._stylesheet())
@@ -1047,7 +1160,12 @@ class VoiceUIMain(QMainWindow):
         title_row = QHBoxLayout()
         title = QLabel("🧽 海绵宝宝 · Voice Agent")
         title.setObjectName("title")
-        sub   = QLabel("⚡ 全双工语音 / 动态声纹 / VAD 智能识别")
+        title_shadow = QGraphicsDropShadowEffect(self)
+        title_shadow.setBlurRadius(18)
+        title_shadow.setOffset(0, 2)
+        title_shadow.setColor(QColor(18, 30, 54, 210))
+        title.setGraphicsEffect(title_shadow)
+        sub   = QLabel("⚡ 实时字幕/全双工/动态声纹/VAD智能识别")
         sub.setObjectName("sub")
         title_row.addWidget(title); title_row.addStretch(); title_row.addWidget(sub)
         root.addLayout(title_row)
@@ -1057,28 +1175,32 @@ class VoiceUIMain(QMainWindow):
         center.setSpacing(16)
         
         # ---- left: avatar + waveform ----
-        left = ScaledBackgroundFrame(LEFT_BG); left.setObjectName("leftPanel")
+        left = QFrame(); left.setObjectName("leftPanel")
+        self.left_panel = left
         ll = QVBoxLayout(left)
         ll.setContentsMargins(20, 14, 20, 14)
         ll.setSpacing(4)
         
         self.avatar = AvatarWidget(AVATAR)
         ll.addWidget(self.avatar, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # 让“声纹 + 实时字幕”整体贴近底部：多余空间放在头像和声纹之间。
+        ll.addStretch(1)
         
+        '''
         wave_title = QLabel("◉  LIVE  WAVEFORM")
-        wave_title.setStyleSheet("color:#d8eeff; font-size:10px; letter-spacing:3px; padding-left:6px;")
+        wave_title.setStyleSheet("color:#eef7ff; font-size:10px; letter-spacing:3px; padding-left:6px;")
         ll.addWidget(wave_title)
+        '''
         
         self.wave = WaveformWidget()
         ll.addWidget(self.wave)
 
-        ll.addStretch(1)
-
         # 实时字幕放到底部（在声波区域下方）。
         self.live_caption = QLabel("🗣  说话中…实时字幕会在这里跳字")
         self.live_caption.setWordWrap(True)
-        self.live_caption.setMinimumHeight(48)
-        self.live_caption.setMaximumHeight(96)
+        self.live_caption.setMinimumHeight(96)
+        self.live_caption.setMaximumHeight(192)
         self.live_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.live_caption.setStyleSheet("""
             QLabel {
@@ -1086,19 +1208,23 @@ class VoiceUIMain(QMainWindow):
                 border: 1px solid #1a4060;
                 border-radius: 8px;
                 padding: 8px 14px;
-                color: #80a0c0;
-                font-size: 14px;
-                font-family: 'PingFang SC','Microsoft YaHei';
+                color: #d7e8f8;
+                font-size: 28px;
+                font-family: __UI_FONT_STACK__;
             }
             QLabel[live="true"] {
                 background: rgba(20, 50, 80, 220);
                 border-color: #50c0ff;
                 color: #ffffff;
-                font-size: 15px;
+                font-size: 30px;
             }
-        """)
+        """.replace("__UI_FONT_STACK__", self._ui_font_stack))
         self.live_caption.setProperty("live", False)
         ll.addWidget(self.live_caption)
+
+        self.recording_badge = RecordingBadgeOverlay(self.left_panel)
+        self.recording_badge.hide()
+        self._layout_recording_badge()
         
         left.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         center.addWidget(left, 3)
@@ -1118,17 +1244,14 @@ class VoiceUIMain(QMainWindow):
         
         # buttons row
         btn_row = QHBoxLayout()
-        self.btn_listen = QPushButton("🎙 开启语音")
-        self.btn_listen.setCheckable(True)
-        btn_row.addWidget(self.btn_listen)
-        self.btn_ptt = QPushButton("🎯 按住空格说话")
+        self.btn_ptt = QPushButton(f"⏺  {PTT_KEY_LABEL}切换录音")
         self.btn_ptt.setCheckable(True)
         btn_row.addWidget(self.btn_ptt)
         btn_row.addWidget(self._make_btn("🧹 清屏", self._clear_transcript))
         rl.addLayout(btn_row)
         
         # slider
-        rl.addWidget(self._small_title("🎚  噪声阀值（越低越灵敏）"))
+        rl.addWidget(self._small_title("🎚  噪声阀值"))
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setMinimum(-60); self.slider.setMaximum(-10)
         self.slider.setValue(-40)
@@ -1138,34 +1261,31 @@ class VoiceUIMain(QMainWindow):
         
         self.thresh_lbl = QLabel()
         self.thresh_lbl.setObjectName("subinfo")
+        self.thresh_lbl.setStyleSheet("color:#ffffff;")
         rl.addWidget(self.thresh_lbl)
-        
-        self.live_lbl = QLabel()
-        self.live_lbl.setObjectName("subinfo")
-        rl.addWidget(self.live_lbl)
         
         # 简易电平条
         bar_frame = QFrame(); bar_frame.setObjectName("meter")
         bfl = QVBoxLayout(bar_frame); bfl.setContentsMargins(8, 6, 8, 6)
-        self.meter_lbl = QLabel("环境: — dBFS  ·  阈值门: OFF")
-        self.meter_lbl.setStyleSheet("color:#80c0ff; font-size:11px;")
-        bfl.addWidget(self.meter_lbl)
         self.meter = QFrame(); self.meter.setMinimumHeight(6)
         self.meter.setStyleSheet("background:#142030; border-radius:3px;")
         bfl.addWidget(self.meter)
         self.meter_fill = QFrame(self.meter)
         self.meter_fill.setStyleSheet("background: qlineargradient(x1:0,x2:1,stop:0 #50e6ff, stop:1 #ff64c8); border-radius:3px;")
         self.meter_fill.setFixedHeight(6)
+        self.meter_lbl = QLabel("— dBFS")
+        self.meter_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.meter_lbl.setStyleSheet("color:#d7e8ff; font-size:36px; font-weight:700;")
+        bfl.addWidget(self.meter_lbl)
         rl.addWidget(bar_frame)
         
         rl.addStretch()
         
         hint = QLabel(
-            "💡 双击头像 = 切换语音总开关\n"
-            "💡 空格按住说话（Push-to-Talk）\n"
+            f"💡 按{PTT_KEY_LABEL}开启/关闭录音\n"
             "💡 海绵宝宝说话时直接开口 → 自动停下"
         )
-        hint.setStyleSheet("color:#406080; font-size:11px;")
+        hint.setStyleSheet("color:#d0e2f6; font-size:11px;")
         rl.addWidget(hint)
         
         right.setMaximumWidth(360)
@@ -1175,7 +1295,13 @@ class VoiceUIMain(QMainWindow):
         root.addLayout(center, 1)
         
         # ---- transcript ----
-        root.addWidget(self._small_title("💬  对话回显"))
+        transcript_title = self._small_title("💬  对话回显")
+        transcript_shadow = QGraphicsDropShadowEffect(self)
+        transcript_shadow.setBlurRadius(12)
+        transcript_shadow.setOffset(0, 1)
+        transcript_shadow.setColor(QColor(0, 0, 0, 180))
+        transcript_title.setGraphicsEffect(transcript_shadow)
+        root.addWidget(transcript_title)
         self.transcript = QTextEdit()
         self.transcript.setReadOnly(True)
         self.transcript.setMaximumHeight(220)
@@ -1191,34 +1317,49 @@ class VoiceUIMain(QMainWindow):
     
     def _small_title(self, text):
         l = QLabel(text)
-        l.setStyleSheet("color:#5090c0; font-size:10px; letter-spacing:2px;")
+        l.setStyleSheet("color:#c6ddf5; font-size:20px; letter-spacing:2px;")
         return l
+
+    def _update_wave_height(self):
+        """根据窗口高度调整声纹区域高度，让最大振幅同步增长。"""
+        target = int(self.height() * 0.24)
+        target = max(140, min(360, target))
+        self.wave.setFixedHeight(target)
+
+    def _layout_recording_badge(self):
+        if hasattr(self, "left_panel") and hasattr(self, "recording_badge"):
+            panel_rect = self.left_panel.rect()
+            wave_top = self.wave.geometry().top() if hasattr(self, "wave") else panel_rect.height()
+            # 悬浮徽标只放在声纹上方，避免遮挡声纹区域。
+            badge_bottom = max(0, wave_top - 8)
+            self.recording_badge.setGeometry(0, 0, panel_rect.width(), badge_bottom)
+            self.recording_badge.raise_()
     
     def _stylesheet(self) -> str:
         return """
-        QWidget#central { background: #07091a; }
-        QWidget { color: #d8e8ff; font-family: 'Menlo','PingFang SC','Microsoft YaHei'; }
-        QLabel#title { font-size: 22px; font-weight: bold; color: #80e6ff; letter-spacing: 2px; }
-        QLabel#sub   { font-size: 12px; color: #6080a0; }
+        QWidget#central { background: transparent; }
+        QWidget { color: #eaf3ff; font-family: __UI_FONT_STACK__; }
+        QLabel#title { font-size: 28px; font-weight: bold; color: rgb(230,219,30); letter-spacing: 2px; }
+        QLabel#sub   { font-size: 18px; color: #444; }
         QLabel#state { font-size: 15px; font-weight: 600; padding: 6px 4px; }
-        QLabel#subinfo { color: #6080a0; font-size: 12px; }
+        QLabel#subinfo { color: #444; font-size: 18px; }
         QFrame#panel {
-            background: rgba(18, 28, 44, 200);
+            background: rgba(18, 28, 44, 120);
             border: 1px solid #1a2a40;
             border-radius: 10px;
         }
         QFrame#leftPanel {
-            background: transparent;
+            background: rgba(18, 28, 44, 0);
             border: 1px solid #1a2a40;
             border-radius: 10px;
         }
-        QFrame#meter { background: rgba(15, 22, 36, 200); border: 1px solid #1a2a40; border-radius: 6px; }
+        QFrame#meter { background: rgba(15, 22, 36, 135); border: 1px solid #1a2a40; border-radius: 6px; }
         QPushButton {
             background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #1a2a40, stop:1 #0e1828);
-            color: #b8d8ff; border: 1px solid #305070; border-radius: 6px;
+            color: #e7f2ff; border: 1px solid #305070; border-radius: 6px;
             padding: 8px 14px; font-size: 13px;
         }
-        QPushButton:hover { background: #1e3252; border-color: #5090d0; color: #d8eeff; }
+        QPushButton:hover { background: #1e3252; border-color: #5090d0; color: #f4fbff; }
         QPushButton:checked { background: #2a4a78; border-color: #80c0ff; color: #fff; }
         QSlider::groove:horizontal {
             background: #142030; height: 8px; border-radius: 4px;
@@ -1233,13 +1374,13 @@ class VoiceUIMain(QMainWindow):
             width: 18px; height: 18px; margin: -7px 0; border-radius: 9px;
         }
         QTextEdit {
-            background: #0a1020; color: #d8e8ff;
+            background: rgba(10, 16, 32, 160); color: #eef5ff;
             border: 1px solid #1a2a40; border-radius: 6px;
             padding: 10px; font-size: 14px;
-            font-family: 'Menlo','PingFang SC','Microsoft YaHei';
+            font-family: __UI_FONT_STACK__;
         }
-        QStatusBar { background: #050818; color: #5090c0; }
-        """
+        QStatusBar { background: rgba(5, 8, 24, 150); color: #c8dcf5; }
+        """.replace("__UI_FONT_STACK__", self._ui_font_stack)
     
     # ---- wire ----
     def _wire(self):
@@ -1259,43 +1400,33 @@ class VoiceUIMain(QMainWindow):
         
         # slider / buttons
         self.slider.valueChanged.connect(self._on_slider)
-        self.btn_listen.toggled.connect(self._on_listen_toggle)
+        self.btn_ptt.toggled.connect(self._on_listen_toggle)
         
         # agent
         self._agent.response_ready.connect(self._on_agent_reply)
         self._agent.error.connect(lambda e: (self._tts.stop(), self._set_state("ERROR"), self._append("系统", e, "#ff8080")))
         
-        # 双击头像
-        self.avatar.mouseDoubleClickEvent = lambda e: self.btn_listen.toggle()
-        
-        # 空格按住说话
-        self.btn_ptt.setAutoRepeat(False)
-        self.btn_ptt.pressed.connect(self._on_ptt_press)
-        self.btn_ptt.released.connect(self._on_ptt_release)
-    
     # ---- slots ----
     def _on_level(self, lvl: float):
         self.wave.set_level(lvl)
         db = lvl * (DB_CEIL - DB_FLOOR) + DB_FLOOR
-        self.live_lbl.setText(f"环境音量: {db:+5.1f} dBFS")
         # 更新电平条
         width = max(2, int(lvl * self.meter.width()))
         self.meter_fill.setFixedWidth(width)
-        # 阈值门指示
-        listening = self.btn_listen.isChecked()
-        self.meter_lbl.setText(
-            f"环境: {db:+5.1f} dBFS  ·  阈值门: {'ON' if listening else 'OFF'}"
-        )
+        self.meter_lbl.setText(f"{db:+5.1f} dBFS")
     
     def _on_slider(self, val: int):
         self.worker.set_threshold(val)
         self.thresh_lbl.setText(f"当前阀值: {val} dBFS")
     
     def _on_listen_toggle(self, on: bool):
-        self.btn_listen.setText("🎙 关闭语音" if on else "🎙 开启语音")
+        self._listening_on = on
+        self.btn_ptt.setText(f"⏹  {PTT_KEY_LABEL}停止录音" if on else f"⏺  {PTT_KEY_LABEL}切换录音")
         self.worker.set_listening(on)
+        self._layout_recording_badge()
+        self.recording_badge.setVisible(on)
         if on:
-            self._set_state("IDLE")
+            self._set_state("RECORDING")
             self._append("系统", "🎙 正在校准环境噪声…", "#80c0ff")
             # 后台自动校准：以环境噪声 p95 + 6dB 作阈值
             def _calib():
@@ -1305,7 +1436,7 @@ class VoiceUIMain(QMainWindow):
                     res = (None, None)
 
                 def _apply():
-                    if not self.btn_listen.isChecked():
+                    if not self._listening_on:
                         return
                     if res and res[0] is not None:
                         thr, p95 = res
@@ -1322,10 +1453,13 @@ class VoiceUIMain(QMainWindow):
             self._tts.stop()
             self.worker.set_barge_in(False)
             self._set_state("IDLE")
-            self._append("系统", "⏹ 语音已关闭", "#6080a0")
+            self._append("系统", "⏹ 语音已关闭", "#c8dcf5")
+
+    def _toggle_recording(self):
+        self.btn_ptt.toggle()
     
     def _on_ptt_press(self):
-        """按住空格/按住按钮 → 立即进入录音"""
+        """按住 PTT 热键/按住按钮 → 立即进入录音"""
         if self._ptt_active:
             return  # 幂等
         self._ptt_active = True
@@ -1340,7 +1474,7 @@ class VoiceUIMain(QMainWindow):
         self._append("系统", "🎯 PTT 录音中…（松开送出）", "#80c0ff")
     
     def _on_ptt_release(self):
-        """松开空格/松开按钮 → 立即送 ASR + 发给海绵宝宝"""
+        """松开 PTT 热键/松开按钮 → 立即送 ASR + 发给海绵宝宝"""
         if not self._ptt_active:
             return
         self._ptt_active = False
@@ -1352,56 +1486,58 @@ class VoiceUIMain(QMainWindow):
         else:
             # buf 空：什么都不送
             self._set_state("IDLE")
-            self._append("系统", "🎯 PTT 未检测到录音", "#6080a0")
+            self._append("系统", "🎯 PTT 未检测到录音", "#c8dcf5")
     
     def _is_text_input_focused(self) -> bool:
-        """Qt输入控件获得焦点时，空格不应被 PTT 抢走"""
+        """Qt输入控件获得焦点时，PTT 热键不应被抢走"""
         from PySide6.QtWidgets import QTextEdit, QLineEdit
         fw = self.focusWidget()
         return isinstance(fw, (QTextEdit, QLineEdit))
     
     def keyPressEvent(self, event):
-        """空格 = 按住说话（但输入控件里不被抢）"""
-        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
-            if not self._is_text_input_focused():
-                self._on_ptt_press()
-                event.accept()
-                return
+        """PTT 热键按下 = 开始说话（但输入控件里不被抢）"""
         super().keyPressEvent(event)
     
     def keyReleaseEvent(self, event):
-        """松开空格 = 结束 PTT"""
-        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
-            if not self._is_text_input_focused():
-                self._on_ptt_release()
-                event.accept()
-                return
+        """松开 PTT 热键 = 结束 PTT"""
         super().keyReleaseEvent(event)
     
-    def _install_space_ptt(self):
-        """用 QShortcut (ApplicationShortcut) 全局接管空格作为 PTT。
-        优先于原生 keyPressEvent，能绕过按钮 / 文本控件对空格的处理。"""
-        from PySide6.QtCore import QEvent
-        # Press shortcut
-        self._sp_press = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
-        self._sp_press.setContext(Qt.ShortcutContext.ApplicationShortcut)
-        self._sp_press.activated.connect(self._on_ptt_press)
-        # Release shortcut：用 eventFilter 监听 KeyRelease，因为 QShortcut 不区分 press/release
+    def _install_ptt_hotkey(self):
+        """全局接管 PTT 热键，绕过焦点控件差异导致的按键丢失。"""
+        # 用应用级 eventFilter 监听按下/松开，保证焦点切换时也能收到空格事件。
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
         self.installEventFilter(self)
     
     def eventFilter(self, obj, event):
-        """接 KeyRelease Space，转 PTT release。
-        Press 已由 QShortcut 处理。"""
+        """接 PTT 热键 KeyPress/KeyRelease，转 PTT press/release。"""
         from PySide6.QtCore import QEvent as _QE
+        if event.type() == _QE.Type.ShortcutOverride:
+            ev = event  # type: QKeyEvent
+            if ev.key() == PTT_KEY:
+                ev.accept()
+                return True
+        if event.type() == _QE.Type.KeyPress:
+            ev = event  # type: QKeyEvent
+            if (ev.key() == PTT_KEY
+                and not ev.isAutoRepeat()):
+                self._space_pressed = True
+                ev.accept()
+                return True
         if event.type() == _QE.Type.KeyRelease:
             ev = event  # type: QKeyEvent
-            if (ev.key() == Qt.Key.Key_Space
-                and not ev.isAutoRepeat()
-                and not self._is_text_input_focused()
-                and self._ptt_active):
-                self._on_ptt_release()
+            if (ev.key() == PTT_KEY
+                and not ev.isAutoRepeat()):
+                if self._space_pressed:
+                    self._toggle_recording()
+                self._space_pressed = False
                 ev.accept()
-                return False
+                return True
+        if event.type() == _QE.Type.ApplicationDeactivate and self._space_pressed:
+            # 应用失焦时兜底收口，避免状态卡在“说话中”。
+            self._space_pressed = False
+            return True
         return super().eventFilter(obj, event)
     
     def _on_interrupt(self):
@@ -1438,7 +1574,7 @@ class VoiceUIMain(QMainWindow):
     def _on_worker_error(self, msg: str):
         # 空识别属于常见场景（说话太短/噪声/云端空返回），不应进入 ERROR 状态。
         if "云端未返回文本" in msg:
-            self._set_state("IDLE")
+            self._set_state("RECORDING" if self._listening_on else "IDLE")
             self.live_caption.setProperty("live", False)
             self.live_caption.setText("🎤  待命")
             self.live_caption.style().unpolish(self.live_caption)
@@ -1486,7 +1622,7 @@ class VoiceUIMain(QMainWindow):
         self._tts_watchdog.stop()
         self.worker.set_barge_in(False)
         self.worker.tts_ended(keep_buf=False)
-        self._set_state("IDLE")
+        self._set_state("RECORDING" if self._listening_on else "IDLE")
     
     def _set_state(self, s: str):
         self._state = s
@@ -1498,16 +1634,21 @@ class VoiceUIMain(QMainWindow):
     
     def _clear_transcript(self):
         self.transcript.clear()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_wave_height()
+        self._layout_recording_badge()
     
-    def _append(self, who: str, text: str, color: str = "#a0d0ff"):
+    def _append(self, who: str, text: str, color: str = "#d6e8ff"):
         sb = self.transcript.verticalScrollBar()
         at_bottom = (sb.value() >= sb.maximum() - 4)
         # 转义 HTML
         safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>")
         html = (
             f'<div style="margin:6px 0;">'
-            f'<span style="color:{color}; font-weight:bold;">{who}:</span> '
-            f'<span style="color:#e0e8f0;">{safe}</span>'
+            f'<span style="color:{color}; font-weight:bold; text-shadow: 0 1px 2px rgba(0,0,0,0.75);">{who}:</span> '
+            f'<span style="color:#e0e8f0; text-shadow: 0 1px 2px rgba(0,0,0,0.75);">{safe}</span>'
             f'</div>'
         )
         self.transcript.append(html)
