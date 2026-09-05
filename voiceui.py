@@ -28,6 +28,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -1121,10 +1122,18 @@ class VoiceUIMain(QMainWindow):
         self._ui_font_stack = _default_ui_font_stack()
         self._app_bg_path = str(LEFT_BG).replace("\\", "/")
         
+        
         self._state = "IDLE"
         self._ptt_active = False
         self._space_pressed = False
         self._listening_on = False
+        self._demo_running = False
+        self._demo_type_timer: QTimer | None = None
+        self._demo_lines: list[str] = []
+        self._demo_step_index = 0
+        self._demo_tts_poll_timer: QTimer | None = None
+        
+                
         # TTS backend: "edge"（在线神经语音，默认）还是 "say"（本地）
         if tts_backend == "say":
             self._tts = SayTTSDriver()
@@ -1376,7 +1385,7 @@ class VoiceUIMain(QMainWindow):
         QTextEdit {
             background: rgba(10, 16, 32, 160); color: #eef5ff;
             border: 1px solid #1a2a40; border-radius: 6px;
-            padding: 10px; font-size: 14px;
+            padding: 10px; font-size: 28px;
             font-family: __UI_FONT_STACK__;
         }
         QStatusBar { background: rgba(5, 8, 24, 150); color: #c8dcf5; }
@@ -1515,7 +1524,7 @@ class VoiceUIMain(QMainWindow):
         from PySide6.QtCore import QEvent as _QE
         if event.type() == _QE.Type.ShortcutOverride:
             ev = event  # type: QKeyEvent
-            if ev.key() == PTT_KEY:
+            if ev.key() in (PTT_KEY, Qt.Key.Key_D):
                 ev.accept()
                 return True
         if event.type() == _QE.Type.KeyPress:
@@ -1527,6 +1536,10 @@ class VoiceUIMain(QMainWindow):
                 return True
         if event.type() == _QE.Type.KeyRelease:
             ev = event  # type: QKeyEvent
+            if (ev.key() == Qt.Key.Key_D and not ev.isAutoRepeat()):
+                self._start_demo_sequence()
+                ev.accept()
+                return True
             if (ev.key() == PTT_KEY
                 and not ev.isAutoRepeat()):
                 if self._space_pressed:
@@ -1552,6 +1565,127 @@ class VoiceUIMain(QMainWindow):
         self.worker.tts_ended()
         # ⚠️ 不要重置 _speech_active / _speech_buf
         # ——barge 模式已在累积，normal 模式会无缝接管
+
+    def _start_demo_sequence(self):
+        """按 D 键触发演示：自动追加对话、实时字幕逐字、并播放 TTS。"""
+        if self._demo_running:
+            return
+        self._demo_running = True
+        self._demo_lines = []
+        self._demo_step_index = 0
+
+        # 先停掉任何正在播放的语音，避免演示串音。
+        self._tts.stop()
+        if hasattr(self, "_tts_watchdog") and self._tts_watchdog is not None:
+            self._tts_watchdog.stop()
+        if self._demo_tts_poll_timer is not None:
+            self._demo_tts_poll_timer.stop()
+        if self._demo_type_timer is not None:
+            self._demo_type_timer.stop()
+
+        self._append("系统", "🔴 录音中（按空格停止）", "#ff8080")
+        self._set_state("RECORDING")
+
+        QTimer.singleShot(1000, self._demo_stage_user_speaking)
+
+    def _demo_stage_user_speaking(self):
+        self._append("系统", "🗣️  蟹老板在说话…", "#80ffb0")
+        self._set_state("USER_SPEAKING")
+        self._demo_type_live_caption("辞职，买张机票去马尔代夫流浪")
+        QTimer.singleShot(1000, self._demo_stage_user_final)
+
+    def _demo_type_live_caption(self, text: str, step_ms: int = 95):
+        if self._demo_type_timer is not None:
+            self._demo_type_timer.stop()
+
+        self.live_caption.setProperty("live", True)
+        self.live_caption.setText("🗣 ")
+        self.live_caption.style().unpolish(self.live_caption)
+        self.live_caption.style().polish(self.live_caption)
+
+        state = {"idx": 0}
+
+        def _tick():
+            state["idx"] += 1
+            shown = text[:state["idx"]]
+            self.live_caption.setText(f"🗣 {shown}")
+            self.live_caption.style().unpolish(self.live_caption)
+            self.live_caption.style().polish(self.live_caption)
+            if state["idx"] >= len(text):
+                if self._demo_type_timer is not None:
+                    self._demo_type_timer.stop()
+
+        self._demo_type_timer = QTimer(self)
+        self._demo_type_timer.timeout.connect(_tick)
+        self._demo_type_timer.start(step_ms)
+
+    def _demo_stage_user_final(self):
+        user_text = "辞职，买张机票去马尔代夫流浪。"
+        self._append("蟹老板", user_text, "#80ffb0")
+        self._set_state("THINKING")
+
+        self._demo_lines = [
+            "🤔 规划辞职与机票中...",
+            "✅ 找到老板email...",
+            "✅ 拟好并发送辞职信",
+            "✅ 连接航空✈️公司",
+            "✅ 马尔代夫机票预订成功",
+            "💕 祝你流浪开心",
+        ]
+        self._demo_step_index = 0
+
+        # 第一条保持 0.5s 后出现；后续每条都等待上一句 TTS 播放完再继续。
+        QTimer.singleShot(500, self._demo_play_next_step)
+
+    def _demo_play_next_step(self):
+        if not self._demo_running:
+            return
+        if self._demo_step_index >= len(self._demo_lines):
+            self._demo_finish()
+            return
+
+        line = self._demo_lines[self._demo_step_index]
+        self._append("海绵宝宝", line, "#ff90d0")
+        self._set_state("AI_SPEAKING")
+        self._speak_tts_text(line)
+
+        if self._demo_tts_poll_timer is None:
+            self._demo_tts_poll_timer = QTimer(self)
+            self._demo_tts_poll_timer.timeout.connect(self._demo_wait_tts_then_continue)
+        if not self._demo_tts_poll_timer.isActive():
+            self._demo_tts_poll_timer.start(120)
+
+    def _demo_wait_tts_then_continue(self):
+        if not self._demo_running:
+            if self._demo_tts_poll_timer is not None:
+                self._demo_tts_poll_timer.stop()
+            return
+        if self._tts.is_speaking():
+            return
+
+        if self._demo_tts_poll_timer is not None:
+            self._demo_tts_poll_timer.stop()
+
+        self._demo_step_index += 1
+        if self._demo_step_index >= len(self._demo_lines):
+            self._demo_finish()
+            return
+
+        QTimer.singleShot(500, self._demo_play_next_step)
+
+    def _demo_finish(self):
+        if self._demo_tts_poll_timer is not None:
+            self._demo_tts_poll_timer.stop()
+        if self._demo_type_timer is not None:
+            self._demo_type_timer.stop()
+        self._demo_lines = []
+        self._demo_step_index = 0
+        self.live_caption.setProperty("live", False)
+        self.live_caption.setText("🎤  待命")
+        self.live_caption.style().unpolish(self.live_caption)
+        self.live_caption.style().polish(self.live_caption)
+        self._set_state("IDLE")
+        self._demo_running = False
     
     def _on_speech_started(self):
         self.live_caption.setProperty("live", True)
@@ -1599,12 +1733,25 @@ class VoiceUIMain(QMainWindow):
         self._append("海绵宝宝", reply, "#ff90d0")
         self._start_tts_playback(reply)
 
+    def _sanitize_tts_text(self, text: str) -> str:
+        """去掉 emoji/图标，避免 TTS 读出符号名。"""
+        cleaned = text.replace("\ufe0f", "").replace("\u200d", "")
+        cleaned = re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF]", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    def _speak_tts_text(self, text: str):
+        tts_text = self._sanitize_tts_text(text)
+        if not tts_text:
+            return
+        self._tts.speak(tts_text)
+
     def _start_tts_playback(self, text: str):
         # 进入 AI_SPEAKING：开启 barge_in + 通知 worker 防自听
         self.worker.set_barge_in(True)
         self.worker.tts_started()
         self._set_state("AI_SPEAKING")
-        self._tts.speak(text)
+        self._speak_tts_text(text)
         # 监听 TTS 是否自然结束（轮询计时器）
         self._tts_watchdog = QTimer(self)
         self._tts_watchdog.setSingleShot(False)
