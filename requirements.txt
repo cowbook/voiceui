@@ -1,0 +1,7 @@
+PySide6>=6.7
+sounddevice>=0.5
+numpy>=2.0
+silero-vad>=5.1
+onnxruntime>=1.18
+dashscope>=1.20
+websockets>=12.0
