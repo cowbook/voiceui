@@ -35,9 +35,14 @@ Write-Host "[voiceui-bootstrap] Installed to $TargetDir"
 
 $bash = Get-Command bash -ErrorAction SilentlyContinue
 if (-not $bash) {
-  throw "[voiceui-bootstrap][error] bash not found. Install Git Bash or use WSL, then run installer/one-click.sh."
+  throw "[voiceui-bootstrap][error] bash not found. Install Git Bash or use WSL, then run installer/install.sh and installer/run.sh."
 }
 
 Push-Location (Join-Path $TargetDir "installer")
-& $bash.Source "./one-click.sh"
+& $bash.Source "./install.sh"
+if ($LASTEXITCODE -ne 0) {
+  Pop-Location
+  exit $LASTEXITCODE
+}
+& $bash.Source "./run.sh"
 Pop-Location
